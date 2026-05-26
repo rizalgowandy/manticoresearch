@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -37,6 +37,27 @@ inline bool StrEq ( Str_t l, const char * r )
 	if ( IsEmpty ( l ) || !r )
 		return ( ( !r && IsEmpty ( l ) ) || ( IsEmpty ( l ) && !*r ) );
 	return strncmp ( l.first, r, l.second ) == 0;
+}
+
+inline bool StrEqN ( Str_t l, const char* r )
+{
+	if ( IsEmpty ( l ) || !r )
+		return ( ( !r && IsEmpty ( l ) ) || ( IsEmpty ( l ) && !*r ) );
+	return strncasecmp ( l.first, r, l.second ) == 0;
+}
+
+inline bool StrEq ( Str_t l, Str_t r )
+{
+	if ( l.second != r.second )
+		return false;
+	return strncmp ( l.first, r.first, l.second ) == 0;
+}
+
+inline bool StrEqN ( Str_t l, Str_t r )
+{
+	if ( l.second != r.second )
+		return false;
+	return strncasecmp ( l.first, r.first, l.second ) == 0;
 }
 
 inline Str_t FromStr ( const CSphString& sString ) noexcept
@@ -109,8 +130,8 @@ inline CSphString CSphString::SubString ( int iStart, int iCount ) const
 	auto iLen = (int)strlen ( m_sValue );
 	iCount = Min ( iLen - iStart, iCount );
 #endif
-	assert ( iStart >= 0 && iStart < iLen );
-	assert ( iCount > 0 );
+	assert ( iStart >= 0 && iStart <= iLen );
+	assert ( iCount >= 0 );
 	assert ( ( iStart + iCount ) <= iLen );
 
 	CSphString sRes;
@@ -312,7 +333,7 @@ inline bool CSphString::operator<( const CSphString& b ) const
 inline void CSphString::Unquote()
 {
 	int l = Length();
-	if ( l && m_sValue[0] == '\'' && m_sValue[l - 1] == '\'' )
+	if ( l>1 && m_sValue[0] == '\'' && m_sValue[l - 1] == '\'' )
 	{
 		memmove ( m_sValue, m_sValue + 1, l - 2 );
 		m_sValue[l - 2] = '\0';

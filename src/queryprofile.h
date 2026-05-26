@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -65,10 +65,11 @@ enum ESphQueryState
 
 	SPH_QSTATE_TOTAL
 };
-STATIC_ASSERT ( SPH_QSTATE_UNKNOWN==0, BAD_QUERY_STATE_ENUM_BASE );
+static_assert ( SPH_QSTATE_UNKNOWN==0, "bad query state enum base" );
 
 struct XQNode_t;
 
+enum class PLAN_FLAVOUR { ENONE, EDESCR, EOBJ, EBOTH };
 /// search query profile
 class QueryProfile_c
 {
@@ -79,9 +80,12 @@ public:
 	int				m_dSwitches [ SPH_QSTATE_TOTAL+1 ];	///< number of switches to given state
 	int64_t			m_tmTotal [ SPH_QSTATE_TOTAL+1 ];	///< total time spent per state
 	CSphVector<BYTE> m_dPlan; 							///< bson with plan
+	PLAN_FLAVOUR	m_eNeedPlan = PLAN_FLAVOUR::EBOTH;
+	bool			m_bNeedProfile = true;
 
 	int				m_iMaxMatches = 0;
 	int				m_iPseudoShards = 1;
+	int64_t			m_iKnnDistanceComputations = 0;
 															/// create empty and stopped profile
 					QueryProfile_c();
 	virtual 		~QueryProfile_c() {}

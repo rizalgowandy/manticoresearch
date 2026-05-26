@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2021-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -82,8 +82,17 @@ void AddToSchema ( CSphSchema & tSchema, const AttrAddRemoveCtx_t & tCtx, CSphSt
 	tInfo.m_uAttrFlags			= tCtx.m_uFlags;
 	tInfo.m_eEngine				= tCtx.m_eEngine;
 	tInfo.m_tLocator.m_iBitCount = tCtx.m_iBits;
+	tInfo.m_tKNN				= tCtx.m_tKNN;
+	tInfo.m_tKNNModel			= tCtx.m_tKNNModel;
+	tInfo.m_sKNNFrom			= tCtx.m_sKNNFrom;
 
-	if ( tSchema.GetAttrId_FirstFieldLen()!=-1 )
+	auto iIdxExisting = tSchema.GetAttrIndex ( tCtx.m_sName.cstr() );
+	if ( iIdxExisting >= 0 )
+	{
+		bRebuild = true;
+		tSchema.RemoveAttr ( tCtx.m_sName.cstr(), false );
+		tSchema.InsertAttr ( iIdxExisting, tInfo, false );
+	} else if ( tSchema.GetAttrId_FirstFieldLen()!=-1 )
 	{
 		bRebuild = true;
 		tSchema.InsertAttr ( tSchema.GetAttrId_FirstFieldLen(), tInfo, false );
@@ -138,8 +147,7 @@ bool RemoveFromSchema ( CSphSchema & tSchema, const CSphString & sAttrName, ESph
 class AddRemoveCtx_c
 {
 public:
-			AddRemoveCtx_c ( const CSphSchema & tOldSchema, const CSphSchema & tNewSchema, const CSphRowitem * pDocinfo, DWORD uNumRows, const BYTE * pBlobPool, WriteWrapper_c & tSPAWriter, WriteWrapper_c & tSPBWriter,
-				const CSphString & sAttrName, const IndexAlterHelper_c & tMinMaxer );
+			AddRemoveCtx_c ( const CSphSchema & tOldSchema, const CSphSchema & tNewSchema, const CSphRowitem * pDocinfo, DWORD uNumRows, const BYTE * pBlobPool, WriteWrapper_c & tSPAWriter, WriteWrapper_c & tSPBWriter, const CSphString & sAttrName, const IndexAlterHelper_c & tMinMaxer );
 
 	bool	AddRowwiseAttr();
 	bool	RemoveRowwiseAttr();
@@ -159,6 +167,7 @@ private:
 	const CSphColumnInfo *		m_pNewBlobRowLocator = nullptr;
 	int							m_iNumOldBlobs = 0;
 	int							m_iNumNewBlobs = 0;
+	int							m_iNumNewSPAAttrs = 0;
 	bool						m_bHadBlobs = false;
 	bool						m_bHaveBlobs = false;
 	int							m_iOldStride = 0;
@@ -169,8 +178,7 @@ private:
 };
 
 
-AddRemoveCtx_c::AddRemoveCtx_c ( const CSphSchema & tOldSchema, const CSphSchema & tNewSchema, const CSphRowitem * pDocinfo, DWORD uNumRows, const BYTE * pBlobPool, WriteWrapper_c & tSPAWriter, WriteWrapper_c & tSPBWriter,
-	const CSphString & sAttrName, const IndexAlterHelper_c & tMinMaxer )
+AddRemoveCtx_c::AddRemoveCtx_c ( const CSphSchema & tOldSchema, const CSphSchema & tNewSchema, const CSphRowitem * pDocinfo, DWORD uNumRows, const BYTE * pBlobPool, WriteWrapper_c & tSPAWriter, WriteWrapper_c & tSPBWriter, const CSphString & sAttrName, const IndexAlterHelper_c & tMinMaxer )
 	: m_tOldSchema ( tOldSchema )
 	, m_tNewSchema ( tNewSchema )
 	, m_pDocinfo ( pDocinfo )
@@ -192,6 +200,8 @@ AddRemoveCtx_c::AddRemoveCtx_c ( const CSphSchema & tOldSchema, const CSphSchema
 	for ( int i = 0; i<tNewSchema.GetAttrsCount(); i++ )
 		if ( sphIsBlobAttr ( tNewSchema.GetAttr(i) ) )
 			m_iNumNewBlobs++;
+		else if ( !tNewSchema.GetAttr(i).IsColumnar() )
+			m_iNumNewSPAAttrs++;
 
 	m_bHadBlobs = m_iNumOldBlobs>0;
 	m_bHaveBlobs = m_iNumNewBlobs>0;
@@ -202,9 +212,11 @@ AddRemoveCtx_c::AddRemoveCtx_c ( const CSphSchema & tOldSchema, const CSphSchema
 
 bool AddRemoveCtx_c::AddRowwiseAttr()
 {
-	bool bHasFieldLen = ( m_tNewSchema.GetAttrId_FirstFieldLen()!=-1 );
+	bool bKeepVal = m_tOldSchema.GetAttrIndex ( m_sAttrName.cstr() ) >= 0;
+	bool bNeedRemap = bKeepVal || m_bHadBlobs != m_bHaveBlobs || m_tNewSchema.GetAttrId_FirstFieldLen() != -1;
+
 	CSphVector<int> dAttrMap;
-	if ( m_bHadBlobs!=m_bHaveBlobs || bHasFieldLen )
+	if ( bNeedRemap )
 		CreateAttrMap ( dAttrMap, m_tOldSchema, m_tNewSchema, -1 );
 
 	const CSphColumnInfo * pNewAttr = m_tNewSchema.GetAttr ( m_sAttrName.cstr() );
@@ -212,20 +224,31 @@ bool AddRemoveCtx_c::AddRowwiseAttr()
 	bool bBlob = sphIsBlobAttr ( *pNewAttr );
 
 	const CSphRowitem * pNextDocinfo = nullptr;
+	CSphVector<float> dFakeKNN;
 
 	for ( RowID_t tRowID = 0; tRowID<m_uNumRows; tRowID++ )
 	{
-		if ( m_bHadBlobs==m_bHaveBlobs && !bHasFieldLen )
-			pNextDocinfo = CopyRow ( m_pDocinfo, m_dAttrRow.Begin(), m_iOldStride );
-		else
+		if ( bNeedRemap )
 			pNextDocinfo = CopyRowAttrByAttr ( m_pDocinfo, m_dAttrRow.Begin(), m_tOldSchema, m_tNewSchema, dAttrMap, m_iOldStride );
+		else
+			pNextDocinfo = CopyRow ( m_pDocinfo, m_dAttrRow.Begin(), m_iOldStride );
 
-		if ( !pNewAttr->m_tLocator.IsBlobAttr() )
+		if ( !bKeepVal && !pNewAttr->m_tLocator.IsBlobAttr() )
 			sphSetRowAttr ( m_dAttrRow.Begin(), pNewAttr->m_tLocator, 0 );
 
 		if ( bBlob && !m_tMinMaxer.Alter_IsMinMax ( m_pDocinfo, m_iOldStride ) )
 		{
-			sphAddAttrToBlobRow ( m_pDocinfo, m_dBlobRow, m_pBlobPool, m_iNumOldBlobs, m_pOldBlobRowLocator ? &m_pOldBlobRowLocator->m_tLocator : nullptr );
+			if ( pNewAttr->m_eAttrType==SPH_ATTR_FLOAT_VECTOR && pNewAttr->IsIndexedKNN() )
+			{
+				int iOldLen = dFakeKNN.GetLength();
+				dFakeKNN.Resize ( pNewAttr->m_tKNN.m_iDims );
+				if ( dFakeKNN.GetLength()>iOldLen )
+					dFakeKNN.ZeroVec();
+
+				sphAddAttrToBlobRow ( m_pDocinfo, m_dBlobRow, m_pBlobPool, m_iNumOldBlobs, m_pOldBlobRowLocator ? &m_pOldBlobRowLocator->m_tLocator : nullptr, (const BYTE*)dFakeKNN.Begin(), dFakeKNN.GetLengthBytes() );
+			}
+			else
+				sphAddAttrToBlobRow ( m_pDocinfo, m_dBlobRow, m_pBlobPool, m_iNumOldBlobs, m_pOldBlobRowLocator ? &m_pOldBlobRowLocator->m_tLocator : nullptr );
 
 			SphOffset_t tRowOffset = m_tSPBWriter.GetPos();
 			m_tSPBWriter.PutBytes ( m_dBlobRow.Begin(), m_dBlobRow.GetLength() );
@@ -255,6 +278,10 @@ bool AddRemoveCtx_c::RemoveRowwiseAttr()
 
 	bool bBlob = sphIsBlobAttr ( tOldAttr );
 	bool bBlobsModified = bBlob && ( m_bHaveBlobs==m_bHadBlobs );
+	bool bHaveNonBlobs = m_iNumNewSPAAttrs>0;
+
+	if ( !m_bHaveBlobs && !bHaveNonBlobs )
+		return true;
 
 	CSphVector<int> dAttrMap;
 	CreateAttrMap ( dAttrMap, m_tOldSchema, m_tNewSchema, iAttrToRemove );
@@ -265,7 +292,7 @@ bool AddRemoveCtx_c::RemoveRowwiseAttr()
 	{
 		pNextDocinfo = CopyRowAttrByAttr ( m_pDocinfo, m_dAttrRow.Begin(), m_tOldSchema, m_tNewSchema, dAttrMap, m_iOldStride );
 
-		if ( bBlobsModified && !m_tMinMaxer.Alter_IsMinMax ( m_pDocinfo, m_iOldStride ) )
+		if ( m_bHaveBlobs && bBlobsModified && !m_tMinMaxer.Alter_IsMinMax ( m_pDocinfo, m_iOldStride ) )
 		{
 			assert(m_pOldBlobRowLocator);
 			sphRemoveAttrFromBlobRow ( m_pDocinfo, m_dBlobRow, m_pBlobPool, m_iNumOldBlobs, tOldAttr.m_tLocator.m_iBlobAttrId, m_pOldBlobRowLocator->m_tLocator );
@@ -356,6 +383,8 @@ protected:
 bool IndexAlterHelper_c::Alter_AddRemoveRowwiseAttr ( const CSphSchema & tOldSchema, const CSphSchema & tNewSchema, const CSphRowitem * pDocinfo, DWORD uNumRows, const BYTE * pBlobPool, WriteWrapper_c & tSPAWriter,
 	WriteWrapper_c & tSPBWriter, bool bAddAttr, const CSphString & sAttrName )
 {
+	if ( !pDocinfo && tOldSchema.GetRowSize() )
+		return false;
 	AddRemoveCtx_c tCtx ( tOldSchema, tNewSchema, pDocinfo, uNumRows, pBlobPool, tSPAWriter, tSPBWriter, sAttrName, *this );
 	if ( bAddAttr )
 		return tCtx.AddRowwiseAttr();
@@ -368,7 +397,7 @@ bool IndexAlterHelper_c::Alter_AddRemoveColumnar ( bool bAdd, const ISphSchema &
 {
 	std::string sErrorSTL;
 
-	CSphVector<std::pair<std::unique_ptr<columnar::Iterator_i>,ESphAttr>> dIterators;
+	CSphVector<std::pair<std::unique_ptr<columnar::Iterator_i>,const CSphColumnInfo *>> dIterators;
 	for ( int i = 0; i < tNewSchema.GetAttrsCount(); i++ )
 	{
 		const CSphColumnInfo & tNewAttr = tNewSchema.GetAttr(i);
@@ -378,7 +407,7 @@ bool IndexAlterHelper_c::Alter_AddRemoveColumnar ( bool bAdd, const ISphSchema &
 		const CSphColumnInfo * pOldAttr = tOldSchema.GetAttr ( tNewAttr.m_sName.cstr() );
 		if ( !pOldAttr )
 		{
-			dIterators.Add ( { nullptr, tNewAttr.m_eAttrType } );
+			dIterators.Add ( { nullptr, &tNewAttr } );
 			continue;
 		}
 
@@ -390,7 +419,7 @@ bool IndexAlterHelper_c::Alter_AddRemoveColumnar ( bool bAdd, const ISphSchema &
 			return false;
 		}
 
-		dIterators.Add ( { std::move (pIterator), pOldAttr->m_eAttrType } );
+		dIterators.Add ( { std::move (pIterator), pOldAttr } );
 	}
 
 	CSphVector<int64_t> dTmp;
@@ -399,10 +428,11 @@ bool IndexAlterHelper_c::Alter_AddRemoveColumnar ( bool bAdd, const ISphSchema &
 		for ( int iColumnarAttr = 0; iColumnarAttr < dIterators.GetLength(); iColumnarAttr++ )
 		{
 			auto & tIterator = dIterators[iColumnarAttr];
+			assert(tIterator.second);
 			if ( tIterator.first )
-				SetColumnarAttr ( iColumnarAttr, tIterator.second, pBuilder, tIterator.first, tRowID, dTmp );
+				SetColumnarAttr ( iColumnarAttr, tIterator.second->m_eAttrType, pBuilder, tIterator.first, tRowID, dTmp );
 			else
-				SetDefaultColumnarAttr ( iColumnarAttr, tIterator.second, pBuilder );
+				SetDefaultColumnarAttr ( iColumnarAttr, *tIterator.second, pBuilder, dTmp );
 		}
 	}
 

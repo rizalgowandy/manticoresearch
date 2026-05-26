@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2018-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2018-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -27,6 +27,8 @@
 #include "attrindex_builder.h"
 #include "tokenizer/charset_definition_parser.h"
 #include "tokenizer/tokenizer.h"
+#include "dict/infix/infix_builder.h"
+#include "dict/stem/sphinxstem.h"
 
 namespace legacy
 {
@@ -65,7 +67,7 @@ typedef int64_t			SphAttr_t;
 const int				ROWITEM_BITS	= 8*sizeof(CSphRowitem);
 const int				ROWITEM_SHIFT	= 5;
 
-STATIC_ASSERT ( ( 1 << ROWITEM_SHIFT )==ROWITEM_BITS, INVALID_ROWITEM_SHIFT );
+static_assert ( ( 1 << ROWITEM_SHIFT )==ROWITEM_BITS, "invalid ROWITEM_SHIFT" );
 
 #ifndef USE_LITTLE_ENDIAN
 #error Please define endianness
@@ -184,6 +186,7 @@ public:
 
 	void GetPrefixedWords ( const char * sSubstring, int iSubLen, const char * sWildcard, Args_t & tArgs ) const override {}
 	void GetInfixedWords ( const char * sSubstring, int iSubLen, const char * sWildcard, Args_t & tArgs ) const override {}
+	void ScanRegexWords ( const VecTraits_T<RegexTerm_t> & dTerms, const ISphWordlist::Args_t & tArgs, const VecExpandConv_t & dConverters ) const override {}
 
 private:
 	bool								m_bWordDict = false;
@@ -663,9 +666,9 @@ bool Wordlist_t::Preread ( const char * sName, DWORD uVersion, bool bWordDict, C
 
 		// FIXME!!! store and load that explicitly
 		if ( iInfixCount )
-			m_iWordsEnd = uInfixOffset - strlen ( g_sTagInfixEntries );
+			m_iWordsEnd = uInfixOffset - g_sTagInfixEntries.second;
 		else
-			m_iWordsEnd -= strlen ( g_sTagInfixEntries );
+			m_iWordsEnd -= g_sTagInfixEntries.second;
 	}
 
 	if ( tReader.GetErrorFlag() )
@@ -889,7 +892,7 @@ CSphRowitem * AttrConverter_t::NextRow()
 				iLen = sphUnpackStr ( m_tIndex.m_tString.GetReadPtr() + uOff, &pStr );
 
 			assert ( m_pBlob );
-			m_pBlob->SetAttr( iBlobAttr++, (const BYTE*)pStr, iLen, m_sError );
+			m_pBlob->SetAttr( iBlobAttr++, (const BYTE*)pStr, iLen, BlobAttrInput_e::RAW_BYTES, m_sError );
 
 		} else if ( tColumnSrc.m_eAttrType==SPH_ATTR_UINT32SET || tColumnSrc.m_eAttrType==SPH_ATTR_INT64SET )
 		{
@@ -926,7 +929,7 @@ CSphRowitem * AttrConverter_t::NextRow()
 				iValues /= 2;
 			}
 
-			m_pBlob->SetAttr ( iBlobAttr++, (const BYTE*)pMva, iValues*sizeof(int64_t), m_sError );
+			m_pBlob->SetAttr ( iBlobAttr++, (const BYTE*)pMva, iValues*sizeof(int64_t), BlobAttrInput_e::MVA_INT64, m_sError );
 		} else
 		{
 			SphAttr_t tValue = sphGetRowAttr ( pAttrs, tColumnSrc.m_tLocator );
@@ -969,8 +972,8 @@ private:
 	CSphVector<Checkpoint_t>		m_dCheckpoints;
 	CSphVector<BYTE>				m_dKeywordCheckpoints;
 	
-	OpenHash_T<RowID_t, SphDocID_t, HashFunc_Int64_t> m_hDoc2Row;
-	OpenHash_T<DoclistOffsets_t, SphOffset_t, HashFunc_Int64_t> m_hDoclist;
+	OpenHashTable_T<SphDocID_t, RowID_t> m_hDoc2Row;
+	OpenHashTable_T<SphOffset_t, DoclistOffsets_t> m_hDoclist;
 
 	bool WriteLookup ( Index_t & tIndex, CSphString & sError );
 	bool WriteAttributes ( Index_t & tIndex, CSphString & sError );
@@ -1061,7 +1064,8 @@ bool ConverterPlain_t::WriteAttributes ( Index_t & tIndex, CSphString & sError )
 	std::unique_ptr<BlobRowBuilder_i> pBlobRowBuilder;
 	if ( pBlobLocatorAttr )
 	{
-		pBlobRowBuilder = sphCreateBlobRowJsonBuilder ( m_tSchema, sSPB, tIndex.m_tSettings.m_tBlobUpdateSpace, sError );
+		BuildBufferSettings_t tSettings; // use default buffer settings
+		pBlobRowBuilder = sphCreateBlobRowJsonBuilder ( m_tSchema, sSPB, tIndex.m_tSettings.m_tBlobUpdateSpace, tSettings.m_iBufferAttributes, sError );
 		if ( !pBlobRowBuilder )
 			return false;
 	}
@@ -1073,10 +1077,8 @@ bool ConverterPlain_t::WriteAttributes ( Index_t & tIndex, CSphString & sError )
 	while ( ( pRow = tConv.NextRow() )!=nullptr )
 	{
 		if ( pBlobLocatorAttr )
-		{
-			SphOffset_t tOffset = pBlobRowBuilder->Flush();
-			sphSetRowAttr ( pRow, pBlobLocatorAttr->m_tLocator, tOffset );
-		}
+			sphSetRowAttr ( pRow, pBlobLocatorAttr->m_tLocator, pBlobRowBuilder->Flush().first );
+
 		tMinMaxBuilder.Collect ( pRow );
 		tWriterSPA.PutBytes ( pRow, iStride*sizeof(CSphRowitem) );
 
@@ -1324,7 +1326,7 @@ bool ConverterPlain_t::ConvertDictionary ( Index_t & tIndex, CSphString & sError
 			iHits = tReaderDict.UnzipInt();
 			tWriterDict.ZipInt ( iDocs );
 			tWriterDict.ZipInt ( iHits );
-			if ( iDocs>=DOCLIST_HINT_THRESH )
+			if ( ( iDocs & HITLESS_DOC_MASK )>=DOCLIST_HINT_THRESH )
 			{
 				BYTE uHint = tReaderDict.GetByte();
 				tWriterDict.PutByte ( uHint );
@@ -1352,10 +1354,10 @@ bool ConverterPlain_t::ConvertDictionary ( Index_t & tIndex, CSphString & sError
 		}
 
 		// skiplist
-		if ( iDocs>(int)SPH_SKIPLIST_BLOCK )
+		if ( ( iDocs & HITLESS_DOC_MASK )>(int)SPH_SKIPLIST_BLOCK )
 			tReaderDict.UnzipInt();
 
-		if ( iDocs>tIndex.m_tSettings.m_iSkiplistBlockSize )
+		if ( ( iDocs & HITLESS_DOC_MASK )>tIndex.m_tSettings.m_iSkiplistBlockSize )
 			tWriterDict.ZipInt ( pOff->m_uSkiplist );
 
 		if ( ( iWords%SPH_WORDLIST_CHECKPOINT )==0 )
@@ -1427,7 +1429,7 @@ void ConverterPlain_t::WriteCheckpoints ( const Index_t & tIndex, CSphWriter & t
 	// primary storage is in the index wide header
 	if ( bKeywordDict )
 	{
-		tWriterDict.PutBytes ( "dict-header", 11 );
+		tWriterDict.PutBlob ( g_sTagDictHeader );
 		tWriterDict.ZipInt ( m_dCheckpoints.GetLength() );
 		tWriterDict.ZipOffset ( m_tCheckpointsPosition );
 		tWriterDict.ZipInt ( tIndex.m_pTokenizer->GetMaxCodepointLength() );

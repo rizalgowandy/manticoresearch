@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2021-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -12,7 +12,6 @@
 
 
 #include "sphinxql_extra.h"
-#include "sphinxql_debug.h"
 
 struct BlobLocator_t
 {
@@ -76,14 +75,32 @@ public:
 		auto& sIns = dVec.Add();
 		ToString ( sIns, tNode ).Unquote();
 	}
+
+	void LockStatement()
+	{
+		m_pStmt->m_eStmt = STMT_LOCK_TABLES;
+	}
+
+	void UnlockStatement()
+	{
+		m_pStmt->m_eStmt = STMT_UNLOCK_TABLES;
+	}
+
+	void LockType (bool bWrite)
+	{
+		m_pStmt->m_iIntParam = bWrite?100:0;
+	}
 };
 
-#define YYSTYPE SqlNode_t
+using YYSTYPE = SqlNode_t;
+static_assert ( IS_TRIVIALLY_COPYABLE ( SqlNode_t ), "YYSTYPE must be trivial for resizable parser stack" );
+# define YYSTYPE_IS_TRIVIAL 1
+# define YYSTYPE_IS_DECLARED 1
 
 // unused parameter, simply to avoid type clash between all my yylex() functions
 #define YY_DECL inline int flex_extraparser ( YYSTYPE* lvalp, void* yyscanner, SqlExtraParser_c* pParser )
 
-#include "flexsphinxqlextra.c"
+#include "flexsphinxql_extra.c"
 
 static void yyerror ( SqlParserTraits_c* pParser, const char* szMessage )
 {

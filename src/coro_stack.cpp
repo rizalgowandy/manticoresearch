@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -20,7 +20,7 @@
 
 namespace Threads {
 
-static StackFlavour_E g_eStackFlavour = val_from_env ( "MANTICORE_GUARDED_STACK", false ) ? StackFlavour_E::protected_fixedsize : StackFlavour_E::fixedsize;
+static StackFlavour_E g_eStackFlavour = env_exists ( "MANTICORE_GUARDED_STACK" ) ? StackFlavour_E::protected_fixedsize : StackFlavour_E::fixedsize;
 
 inline size_t AlignStackSize ( size_t iSize )
 {
@@ -44,6 +44,7 @@ CoroStack_t AllocateStack ( size_t iStack )
 		}
 	default:
 		assert(false && "should not be here");
+		return {}; // just to suppress a warning
 	}
 }
 
@@ -53,7 +54,7 @@ CoroStack_t MockedStack ( VecTraits_T<BYTE> dStack )
 	tStack.sp = &dStack.Last();
 	tStack.size = dStack.GetLength();
 #if defined( BOOST_USE_VALGRIND )
-	tStack.valgrind_stack_id = VALGRIND_STACK_REGISTER ( tStack.sp, dStack.begin() );
+	tStack.valgrind_stack_id = VALGRIND_STACK_REGISTER ( dStack.begin(), tStack.sp );
 #endif
 	return { tStack, StackFlavour_E::mocked_prealloc };
 }

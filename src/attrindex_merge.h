@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -15,19 +15,21 @@
 #include "sphinx.h"
 #include "indexformat.h"
 
+struct BuildBufferSettings_t;
+
 class AttrMerger_c
 {
 	class Impl_c;
 	std::unique_ptr<Impl_c> m_pImpl;
 
 public:
-	AttrMerger_c ( MergeCb_c& tMonitor, CSphString& sError, int64_t iTotalDocs );
+	AttrMerger_c ( MergeCb_c& tMonitor, CSphString& sError, int64_t iTotalDocs, const BuildBufferSettings_t & tSettings, StrVec_t & dCreatedFiles );
 	~AttrMerger_c();
 
 	bool Prepare ( const CSphIndex * pSrcIndex, const CSphIndex * pDstIndex );
+	bool AnalyzeAttributes ( const CSphIndex& tIndex, const VecTraits_T<RowID_t>& dRowMap, DWORD uAlive );
 	bool CopyAttributes ( const CSphIndex & tIndex, const VecTraits_T<RowID_t> & dRowMap, DWORD uAlive );
-	bool FinishMergeAttributes ( const CSphIndex * pDstIndex, BuildHeader_t & tBuildHeader, StrVec_t* pCreatedFiles );
+	bool FinishMergeAttributes ( const CSphIndex * pDstIndex, BuildHeader_t & tBuildHeader );
 };
 
-bool SiRecreate ( MergeCb_c & tMonitor, const CSphIndex & tIndex, const VecTraits_T<RowID_t> & dRowMap, CSphString & sFile, CSphString & sError );
-
+bool SiRecreate ( MergeCb_c & tMonitor, const CSphIndex & tIndex, int64_t iNumDocs, StrVec_t & dOldFiles, StrVec_t & dNewFiles, CSphString & sError );

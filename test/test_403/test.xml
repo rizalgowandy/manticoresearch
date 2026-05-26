@@ -8,11 +8,6 @@
 <skip_indexer/>
 
 <config>
-indexer
-{
-	mem_limit		= 16M
-}
-
 searchd
 {
 	<searchd_Settings/>
@@ -48,15 +43,15 @@ drop table test4;
 create table test4 ( title text, tag integer ) wordforms = '<this_test/>/wordforms.txt';
 drop table test4;
 
-create table movies(title text, year int) morphology='stem_en' html_strip='1' stopwords='<this_test/>/stops.txt' bigram_index='1';
+create table movies(title text, year_ int) morphology='stem_en' html_strip='1' stopwords='<this_test/>/stops.txt' bigram_index='1';
 show tables;
-create table movies(title text, year int) morphology='stem_en' html_strip='1' stopwords='<this_test/>/stops.txt' bigram_index='1';
+create table movies(title text, year_ int) morphology='stem_en' html_strip='1' stopwords='<this_test/>/stops.txt' bigram_index='1';
 show tables;
 
 create table test1 (title text) wordforms = '<this_test/>/wordforms.txt <this_test/>/wordforms2.txt';
-show create table test1;
+show create table test1 OPTION output_words = 'file';
 create table test2 like test1;
-show create table test2;
+show create table test2 OPTION output_words = 'file';
 insert into test2 values (1,'word form');
 insert into test2 values (2,'word1 form1');
 select * from test2 where match('wordform');
@@ -65,7 +60,7 @@ drop table test1;
 drop table test2;
 
 create table test1 (title text) wordforms = '<this_test/>/wordform*.txt';
-show create table test1;
+show create table test1 OPTION output_words = 'file';
 drop table test1;
 
 create table test1(title text) charset_table='non_cjk #' stopwords='<this_test/>/stops.txt';
@@ -82,6 +77,24 @@ create table test4 ( title text, tag integer ) exceptions = '<this_test/>/exc1.t
 call keywords('a b', 'test4');
 call keywords('a', 'test4');
 drop table test4;
+</sphinxql>
+
+<!-- create table should fail on missed wordforms (exact file without search mask) -->
+<sphinxql>
+create table test2 ( title text, tag integer ) wordforms = '<this_test/>/wrong.file';
+</sphinxql>
+
+<!-- alter table failed on add any external files -->
+<sphinxql>
+create table test_alter ( title text, tag integer );
+
+alter table test_alter exceptions='<this_test/>/exc1.txt';
+alter table test_alter stopwords='<this_test/>/stops1.txt';
+alter table test_alter wordforms='<this_test/>/wordforms2.txt';
+
+SHOW CREATE TABLE test_alter OPTION output_words = 'file';
+SHOW CREATE TABLE test_alter OPTION output_words = 'list';
+drop table test_alter;
 </sphinxql>
 
 </queries>

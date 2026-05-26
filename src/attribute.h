@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -25,34 +25,50 @@ struct CSphAttrLocator;
 struct ThrottleState_t;
 class DebugCheckReader_i;
 
+enum class BlobAttrInput_e
+{
+	RAW_BYTES,
+	MVA_INT64,
+	MVA_DWORD
+};
+
 class BlobRowBuilder_i
 {
 public:
 	virtual				~BlobRowBuilder_i() {}
 
-	virtual bool		SetAttr ( int iAttr, const BYTE * pData, int iDataLen, CSphString & sError ) = 0;
-	virtual SphOffset_t	Flush() = 0;
-	virtual SphOffset_t	Flush ( const BYTE * pOldRow ) = 0;
+	virtual bool		SetAttr ( int iAttr, const BYTE * pData, int iDataLen, BlobAttrInput_e eInput, CSphString & sError ) = 0;
+	virtual std::pair<SphOffset_t,SphOffset_t> Flush() = 0;
+	virtual std::pair<SphOffset_t,SphOffset_t> Flush ( const BYTE * pOldRow ) = 0;
 	virtual bool		Done ( CSphString & sError ) = 0;
+};
+
+struct TypedAttribute_t
+{
+	CSphString	m_sName;
+	ESphAttr	m_eType;
 };
 
 
 // create file-based blob row builder
-std::unique_ptr<BlobRowBuilder_i>	sphCreateBlobRowBuilder ( const ISphSchema & tSchema, const CSphString & sFile, SphOffset_t tSpaceForUpdates, CSphString & sError );
+std::unique_ptr<BlobRowBuilder_i>	sphCreateBlobRowBuilder ( const ISphSchema & tSchema, const CSphString & sFile, SphOffset_t tSpaceForUpdates, int iBufferSize, CSphString & sError );
 
 // create file-based blob row builder with JSON already packed
-std::unique_ptr<BlobRowBuilder_i>	sphCreateBlobRowJsonBuilder ( const ISphSchema & tSchema, const CSphString & sFile, SphOffset_t tSpaceForUpdates, CSphString & sError );
+std::unique_ptr<BlobRowBuilder_i>	sphCreateBlobRowJsonBuilder ( const ISphSchema & tSchema, const CSphString & sFile, SphOffset_t tSpaceForUpdates, int iBufferSize, CSphString & sError );
 
 // create mem-based blob row builder
 std::unique_ptr<BlobRowBuilder_i>	sphCreateBlobRowBuilder ( const ISphSchema & tSchema, CSphTightVector<BYTE> & dPool );
 
 // create mem-based blob row builder for updates
-std::unique_ptr<BlobRowBuilder_i>	sphCreateBlobRowBuilderUpdate ( const ISphSchema & tSchema, CSphTightVector<BYTE> & dPool, const CSphBitvec & dAttrsUpdated );
+std::unique_ptr<BlobRowBuilder_i>	sphCreateBlobRowBuilderUpdate ( const ISphSchema & tSchema, const CSphVector<TypedAttribute_t> & dAttrs, CSphTightVector<BYTE> & dPool, const CSphBitvec & dAttrsUpdated );
 
 // fetches a attribute data and its length from the pool
 const BYTE *		sphGetBlobAttr ( const CSphMatch & tMatch, const CSphAttrLocator & tLocator, const BYTE * pBlobPool, int & iLengthBytes );
 
 ByteBlob_t			sphGetBlobAttr ( const CSphMatch & tMatch, const CSphAttrLocator & tLocator, const BYTE * pBlobPool );
+
+// fetch attribute data from a given blob row
+ByteBlob_t			sphGetBlobAttr ( const BYTE * pBlobRow, const CSphAttrLocator & tLocator );
 
 // same as above, but works with docinfo
 const BYTE *		sphGetBlobAttr ( const CSphRowitem * pDocinfo, const CSphAttrLocator & tLocator, const BYTE * pBlobPool, int & iLengthBytes );
@@ -69,7 +85,7 @@ DWORD				sphGetBlobTotalLen ( const BYTE * pBlobRow, int nBlobAttrs );
 int64_t				sphCopyBlobRow ( CSphTightVector<BYTE> & dDstPool, const CSphTightVector<BYTE> & dSrcPool, int64_t iOffset, int nBlobs );
 
 // add a new blob attr to a row (on ALTER)
-void				sphAddAttrToBlobRow ( const CSphRowitem * pDocinfo, CSphTightVector<BYTE> & dBlobRow, const BYTE * pPool, int nBlobs, const CSphAttrLocator * pOldBlobRowLoc );
+void				sphAddAttrToBlobRow ( const CSphRowitem * pDocinfo, CSphTightVector<BYTE> & dBlobRow, const BYTE * pPool, int iNumBlobs, const CSphAttrLocator * pOldBlobRowLoc, const BYTE * pData=nullptr, DWORD uDataLen=0 );
 
 // remove a blob attr from a blob row (on ALTER)
 void				sphRemoveAttrFromBlobRow ( const CSphRowitem * pDocinfo, CSphTightVector<BYTE> & dBlobRow, const BYTE * pPool, int nBlobs, int iBlobAttrId, const CSphAttrLocator & tBlobRowLoc );
@@ -79,6 +95,9 @@ bool				sphCheckBlobRow ( int64_t iOff, DebugCheckReader_i & tBlobs, const CSphS
 
 // return blob locator attribute name
 const char *		sphGetBlobLocatorName();
+
+// return null mask attribute name
+const char *		GetNullMaskAttrName();
 
 // current docid attribute name
 const char *		sphGetDocidName();
@@ -91,6 +110,8 @@ bool				sphIsBlobAttr ( ESphAttr eAttr );
 bool				sphIsBlobAttr ( const CSphColumnInfo & tAttr );
 
 bool				IsMvaAttr ( ESphAttr eAttr );
+bool				IsBlobAttrEmpty ( const ByteBlob_t & tAttr );
+bool				IsBlobAttrZero ( const ByteBlob_t & tAttr, int iDims );
 
 //////////////////////////////////////////////////////////////////////////
 // data ptr attributes
@@ -121,11 +142,9 @@ ESphAttr			sphPlainAttrToPtrAttr ( ESphAttr eAttrType );
 // is this a data ptr attribute?
 bool				sphIsDataPtrAttr ( ESphAttr eAttrType );
 
-namespace sph {
-	// just repack (matter of optimizing)
-	BYTE * CopyPackedAttr ( const BYTE * pData );
-}
-
+// just repack (matter of optimizing)
+BYTE *				sphCopyPackedAttr ( const BYTE * pData );
+BYTE *				sphCopyPackedTdigestAttr ( const BYTE * pData );
 
 //////////////////////////////////////////////////////////////////////////
 // misc attribute-related
@@ -134,16 +153,24 @@ bool	sphIsInternalAttr ( const CSphString & sAttrName );
 bool	sphIsInternalAttr ( const CSphColumnInfo & tCol );
 void	sphMVA2Str ( ByteBlob_t dMVA, bool b64bit, StringBuilder_c & dStr );
 void	sphPackedMVA2Str ( const BYTE * pMVA, bool b64bit, StringBuilder_c & dStr );
+void	sphFloatVec2Str ( ByteBlob_t dFloatVec, StringBuilder_c & dStr );
+void	sphPackedFloatVec2Str ( const BYTE * pData, StringBuilder_c & dStr );
 
 /// check if tColumn is actually stored field (so, can't be used in filters/expressions)
 bool	IsNotRealAttribute ( const CSphColumnInfo & tColumn );
 
-
-inline DocID_t sphGetDocID ( const CSphRowitem * pData )
+FORCE_INLINE DocID_t sphGetDocID ( const CSphRowitem * pData )
 {
 	assert ( pData );
-	return sphUnalignedRead ( *(DocID_t*)(const_cast<CSphRowitem *>(pData)) );
+#if USE_LITTLE_ENDIAN
+	return *(DocID_t *) ( const_cast<CSphRowitem *>(pData) );
+#else
+	return DocID_t ( pData[0] )+( DocID_t ( pData[1] ) << ROWITEM_BITS );
+#endif
 }
+
+void				sphDeallocatePacked ( const BYTE* pBlob );
+void				sphDeallocatePackedTdigest ( const BYTE * pBlob );
 
 const char * AttrType2Str ( ESphAttr eAttrType );
 

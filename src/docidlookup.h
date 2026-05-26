@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2018-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2018-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -15,12 +15,13 @@
 
 class CSphWriter;
 
+#pragma pack( push, 4 )
 struct DocidRowidPair_t
 {
 	DocID_t m_tDocID;
 	RowID_t	m_tRowID;
 };
-
+#pragma pack( pop )
 
 struct DocidLookupCheckpoint_t
 {
@@ -39,12 +40,12 @@ public:
 	bool			Finalize ( CSphString & sError );
 
 private:
-	static const int DOCS_PER_LOOKUP_CHECKPOINT = 64;
+	static constexpr int DOCS_PER_LOOKUP_CHECKPOINT = 64;
 
 	CSphWriter&		m_tWriter;
 	DWORD			m_nDocs;
 
-	int				m_iProcessed {0};
+	int64_t			m_iProcessed {0};
 	int				m_iCheckpoint {0};
 	SphOffset_t		m_tCheckpointStart {0};
 	DocID_t			m_tLastDocID {0};
@@ -81,17 +82,16 @@ public:
 			return tRowID;
 
 		int iDocsInCheckpoint = GetNumDocsInCheckpoint(pFound);
-		for ( int i = 1; i < iDocsInCheckpoint; i++ )
+		for ( int i = 1; i < iDocsInCheckpoint; ++i )
 		{
-			DocID_t tDeltaDocID = UnzipOffsetBE(pCur);
-			assert ( tDeltaDocID>=0 );
+			uint64_t tDeltaDocID = UnzipOffsetBE(pCur);
 			tRowID = sphUnalignedRead ( *(const RowID_t*)pCur );
 			pCur += sizeof(RowID_t);
 
 			tCurDocID += tDeltaDocID;
 			if ( tCurDocID==tDocID )
 				return tRowID;
-			else if ( (uint64_t)tCurDocID>(uint64_t)tDocID )
+			if ( (uint64_t)tCurDocID>(uint64_t)tDocID )
 				return INVALID_ROWID;
 		}
 
@@ -174,12 +174,11 @@ public:
 			tRowID = sphUnalignedRead ( *(RowID_t*)const_cast<BYTE*>(m_pCur) );
 			m_pCur += sizeof(RowID_t);
 
-			m_iProcessedDocs++;
+			++m_iProcessedDocs;
 			return true;
 		}
 
-		DocID_t tDelta = UnzipOffsetBE ( m_pCur );
-		assert ( tDelta>=0 );
+		uint64_t tDelta = UnzipOffsetBE ( m_pCur );
 
 		tRowID = sphUnalignedRead ( *(RowID_t*)const_cast<BYTE*>(m_pCur) );
 		m_pCur += sizeof(RowID_t);
@@ -187,7 +186,7 @@ public:
 		m_tCurDocID += tDelta;
 		tDocID = m_tCurDocID;
 
-		m_iProcessedDocs++;
+		++m_iProcessedDocs;
 		return true;
 	}
 
@@ -243,7 +242,7 @@ private:
 };
 
 
-CSphVector<RowidIterator_i *> CreateLookupIterator ( CSphVector<SecondaryIndexInfo_t> & dSIInfo, const CSphVector<CSphFilterSettings> & dFilters, const BYTE * pDocidLookup, uint32_t uTotalDocs );
+RowIteratorsWithEstimates_t CreateLookupIterator ( CSphVector<SecondaryIndexInfo_t> & dSIInfo, const CSphVector<CSphFilterSettings> & dFilters, const BYTE * pDocidLookup, uint32_t uTotalDocs );
 bool	WriteDocidLookup ( const CSphString & sFilename, const VecTraits_T<DocidRowidPair_t> & dLookup, CSphString & sError );
 
 struct CmpDocidLookup_fn

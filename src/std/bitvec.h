@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -25,7 +25,8 @@ class BitVec_T
 public:
 	BitVec_T () = default;
 
-	explicit BitVec_T ( int iElements );
+	explicit BitVec_T ( DWORD uElements );
+	explicit BitVec_T ( T * pData, DWORD uElements );
 	~BitVec_T ();
 
 	void Swap ( BitVec_T & rhs ) noexcept;
@@ -33,20 +34,22 @@ public:
 	BitVec_T ( const BitVec_T& rhs );
 	BitVec_T & operator= ( BitVec_T rhs );
 
-	void Init ( int iElements );
+	void Init ( DWORD iElements );
 	void Clear();
 	void Set ();
-	bool BitGet ( int iIndex ) const;
-	void BitSet ( int iIndex );
-	void BitClear ( int iIndex );
-	const T * Begin() const;
+	bool BitGet ( DWORD uIndex ) const noexcept;
+	bool BitGetOr ( DWORD uIndex, bool bAlternative=false ) const noexcept;
+	void BitSet ( DWORD uIndex );
+	void BitClear ( DWORD uIndex );
+	const T * Begin() const noexcept;
 	T * Begin();
-	int GetSizeBytes () const;
-	int GetSize() const;
+	int GetSizeBytes () const noexcept;
+	DWORD GetSize() const noexcept;
 
-	bool IsEmpty() const;
-	int BitCount () const;
-	int Scan ( int iStart );
+	bool IsEmpty() const noexcept;
+	DWORD BitCount () const noexcept;
+	DWORD Scan ( DWORD uStart ) const;
+	void Negate ();
 
 protected:
 	static constexpr int	SIZEBITS = sizeof ( T ) * CHAR_BIT;
@@ -56,11 +59,12 @@ protected:
 
 	T *		m_pData = nullptr;
 	T		m_dStatic[STATICSIZE] {0};
-	int		m_iElements = 0;
+	DWORD	m_uElements = 0;
+	bool	m_bOwnStorage = true;
 
 private:
-	int ScanBit ( int iIndex, int iStart );
-	int CalcStorage() const;
+	int ScanBit ( int iIndex, int iStart ) const;
+	int CalcStorage() const noexcept;
 };
 
 using CSphBitvec = BitVec_T<>;

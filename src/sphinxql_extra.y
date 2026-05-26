@@ -3,6 +3,11 @@
 #pragma warning(push,1)
 #pragma warning(disable:4702) // unreachable code
 #endif
+
+#ifdef __GNUC__
+#pragma GCC diagnostic ignored "-Wfree-nonheap-object"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#endif
 %}
 
 %lex-param		{ class SqlExtraParser_c * pParser }
@@ -10,11 +15,17 @@
 %pure-parser
 %error-verbose
 
+%token	END 0 "$end"
 %token	TOK_CONST_FLOAT
 %token	TOK_CONST_INT
 %token	TOK_IDENT "identifier"
+%token	TOK_TABLE_IDENT "tablename"
+
 %token	TOK_QUOTED_STRING "string"
 
+%token	TOK_CREATE
+%token	TOK_COLUMNS
+%token	TOK_DATABASE
 %token	TOK_FIELDS
 %token	TOK_FLUSH
 %token	TOK_FROM
@@ -34,6 +45,7 @@
 %token	TOK_USE
 %token	TOK_WITH
 %token	TOK_WRITE
+%token	TOK_COMMENT
 
 %{
 
@@ -57,25 +69,40 @@ statement:
 	| savepoint_sp
 	| show_fields
 	| show_triggers
+	| create_database
+	| comments
 	;
 
 //////////////////////////////////////////////////////////////////////////
 
+// generic ident - like name of the variable, column, etc. but NOT name of the table.
 ident:
 	TOK_FIELDS | TOK_FLUSH | TOK_FROM | TOK_LOCK | TOK_READ | TOK_RELOAD | TOK_SAVEPOINT
 	| TOK_SET | TOK_SHOW | TOK_TABLE | TOK_TABLES | TOK_UNLOCK | TOK_USE | TOK_WITH | TOK_IDENT
-	| TOK_TRIGGERS | TOK_LIKE
+	| TOK_TRIGGERS | TOK_LIKE | TOK_CREATE | TOK_DATABASE | TOK_COLUMNS
 	; // no TOK_SESSION, no TOK_GLOBAL
 
 //////////////////////////////////////////////////////////////////////////
-
-set_string_value:
+param_ident: ident;
+savepoint_ident: ident;
+database_ident: ident;
+table_db_ident:
 	ident
-	| TOK_QUOTED_STRING
+	| ident '.' ident { TRACK_BOUNDS ( $$, $1, $3 ); }
+	;
+
+table_ident:
+	table_db_ident
+	| TOK_TABLE_IDENT // covers all like `cluster:table` and `cluster:db.table`
+	| ident ':' table_db_ident { TRACK_BOUNDS ( $$, $1, $3 ); }
 	;
 
 anysetvalue:
-	set_string_value
+	ident
+		{
+    		pParser->AddStrval ( pParser->m_pStmt->m_dInsertValues, $1 );
+    	}
+    | TOK_QUOTED_STRING
 		{
 			pParser->AddStrval ( pParser->m_pStmt->m_dInsertValues, $1 );
 		}
@@ -99,7 +126,7 @@ const_int:
 	;
 
 ident_value:
-	ident '=' anysetvalue
+	param_ident '=' anysetvalue
 		{
 			pParser->AddSetName ( pParser->m_pStmt->m_dInsertSchema, $1 );
 		}
@@ -152,28 +179,50 @@ optional_with_read_lock:
 unlock_tables:
 	TOK_UNLOCK TOK_TABLES
 		{
-			pParser->DefaultOk();
+			pParser->UnlockStatement ();
 		}
 	;
 
 //////////////////////////////////////////////////////////////////////////
 
 lock_tables:
-	TOK_LOCK TOK_TABLES ident read_or_write
+	TOK_LOCK TOK_TABLES list_locked
 		{
-			pParser->DefaultOk();
+			pParser->LockStatement ();
+		}
+	;
+
+list_locked:
+	lock_table
+	| list_locked ',' lock_table
+
+lock_table:
+	table_ident read_or_write opt_comment
+		{
+			pParser->AddStrval ( pParser->m_pStmt->m_dInsertValues, $1 );
 		}
 	;
 
 read_or_write:
 	TOK_READ
+		{
+			pParser->LockType(false);
+		}
 	| TOK_WRITE
+		{
+			pParser->LockType(true);
+		}
+	;
+
+opt_comment:
+	// empty
+	| comment
 	;
 
 //////////////////////////////////////////////////////////////////////////
 
 use_database:
-	TOK_USE ident
+	TOK_USE database_ident
 		{
 			pParser->DefaultOk();
 		}
@@ -182,16 +231,19 @@ use_database:
 //////////////////////////////////////////////////////////////////////////
 
 savepoint_sp:
-	TOK_SAVEPOINT ident
+	TOK_SAVEPOINT savepoint_ident
 		{
 			pParser->DefaultOk();
 		}
 	;
 
 //////////////////////////////////////////////////////////////////////////
+fields_or_columns:
+	TOK_FIELDS | TOK_COLUMNS
+	;
 
 show_fields:
-	TOK_SHOW TOK_FIELDS TOK_FROM ident like_filter
+	TOK_SHOW fields_or_columns TOK_FROM table_ident like_filter
 		{
 			pParser->SetIndex ($4);
 			pParser->m_pStmt->m_eStmt = STMT_DESCRIBE;
@@ -213,6 +265,25 @@ like_filter:
 	| TOK_LIKE TOK_QUOTED_STRING		{ pParser->m_pStmt->m_sStringParam = pParser->ToStringUnescape ($2 ); }
 	;
 
+
+create_database:
+	TOK_CREATE TOK_DATABASE database_ident
+		{
+    		pParser->DefaultOk();
+    	}
+    ;
+
+comment:
+	TOK_COMMENT
+		{
+    		pParser->Comment($1);
+    	}
+    ;
+
+comments:
+	comments comment
+	| comment
+	;
 %%
 
 #if _WIN32

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -15,14 +15,18 @@
 /// generic comparator
 template<typename T> struct SphLess_T
 {
-	inline static bool IsLess ( const T& a, const T& b ) { return a < b; }
+	static bool IsLess ( const T& a, const T& b ) noexcept
+	{
+		static_assert ( !std::is_pointer_v<T>, "Don't implicitly compare pointers" );
+		return a < b;
+	}
 };
 
 
 /// generic comparator
 template<typename T> struct SphGreater_T
 {
-	inline static bool IsLess ( const T& a, const T& b ) { return b < a; }
+	inline static bool IsLess ( const T& a, const T& b ) noexcept { return b < a; }
 };
 
 
@@ -33,7 +37,7 @@ struct SphMemberLess_T
 	const T C::*m_pMember;
 
 	explicit SphMemberLess_T ( T C::*pMember );
-	inline bool IsLess ( const C& a, const C& b ) const;
+	inline bool IsLess ( const C& a, const C& b ) const noexcept;
 };
 
 template<typename T, typename C>
@@ -47,7 +51,7 @@ struct SphLesser
 	explicit SphLesser ( COMP&& fnComp );
 
 	template<typename T>
-	bool IsLess ( T&& a, T&& b ) const;
+	bool IsLess ( T&& a, T&& b ) const noexcept ( noexcept ( m_fnComp ) );
 };
 
 // make
@@ -63,9 +67,9 @@ struct SphMemberFunctor_T
 	const T CLASS::*m_pMember;
 
 	explicit SphMemberFunctor_T ( T CLASS::*pMember );
-	const T& operator() ( const CLASS& arg ) const;
-	inline bool IsLess ( const CLASS& a, const CLASS& b ) const;
-	inline bool IsEq ( const CLASS& a, T b );
+	const T& operator() ( const CLASS& arg ) const noexcept;
+	inline bool IsLess ( const CLASS& a, const CLASS& b ) const noexcept;
+	inline bool IsEq ( const CLASS& a, T b ) const noexcept;
 };
 
 
@@ -98,7 +102,11 @@ struct SphEqualityFunctor_T
 struct IdentityHash_fn
 {
 	template<typename INT>
-	static inline INT Hash ( INT iValue ) { return iValue; }
+	static INT Hash ( INT iValue ) { return iValue; }
+	template<typename INT>
+	static INT GetHash ( INT iValue ) { return iValue; }
+	template<typename INT>
+	static bool Equal (INT a, INT b) { return a==b; }
 };
 
 #include "comp_impl.h"

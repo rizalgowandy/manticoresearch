@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -14,7 +14,12 @@
 
 //////////////////////////////////////////////////////////////////////////
 
-void DiskDictTraits_c::DictBegin ( CSphAutofile&, CSphAutofile& tDict, int )
+void DiskDictTraits_c::DictBegin ( CSphAutofile&, CSphAutofile& tDict, int iLimit )
+{
+	DiskDictTraits_c::SortedDictBegin ( tDict, iLimit, 0 );
+}
+
+void DiskDictTraits_c::SortedDictBegin ( CSphAutofile& tDict, int, int )
 {
 	m_wrDict.CloseFile();
 	m_wrDict.SetFile ( tDict, nullptr, m_sWriterError );
@@ -79,7 +84,7 @@ void DiskDictTraits_c::DictEntry ( const DictEntry_t& tEntry )
 	m_wrDict.ZipInt ( tEntry.m_iHits );
 
 	// write skiplist location info, if any
-	if ( tEntry.m_iDocs > m_iSkiplistBlockSize )
+	if ( ( tEntry.m_iDocs & HITLESS_DOC_MASK ) > m_iSkiplistBlockSize )
 		m_wrDict.ZipOffset ( tEntry.m_iSkiplistOffset );
 
 	++m_iEntries;

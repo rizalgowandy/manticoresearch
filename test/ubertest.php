@@ -75,7 +75,7 @@ $locals['ctest'] = false;
 if ( array_key_exists ( "DBUSER", $_ENV ) && $_ENV["DBUSER"] )
 	$locals['db-user'] = $_ENV["DBUSER"];
 
-if ( array_key_exists ( "DBPASS", $_ENV ) && $_ENV["DBPASS"] ) 
+if ( array_key_exists ( "DBPASS", $_ENV ) && $_ENV["DBPASS"] )
 	$locals['db-password'] = $_ENV["DBPASS"];
 
 $run = false;
@@ -108,7 +108,6 @@ for ( $i=0; $i<count($args); $i++ )
 	else if ( $arg=="--ctest" )						{ $locals['ctest'] = true; $ctest = true; $force_guess = false; }
 	else if ( $arg=="--rt" )						$locals['rt_mode'] = true;
 	else if ( $arg=="--columnar" )					$locals['columnar_mode'] = true;
-	else if ( $arg=="--test-thd-pool" )				$locals['use_pool'] = true;
 	else if ( $arg=="--strict" )					$g_strict = true;
 	else if ( $arg=="--strict-verbose" )			{ $g_strict = true; $g_strictverbose = true; }
 	else if ( $arg=="--valgrind-searchd" )			$locals['valgrindsearchd'] = true;
@@ -155,10 +154,10 @@ $VLG = getenv('VLG');
 
 $python = getenv('python');
 if (!$python)
-	$python = "/usr/bin/python";
+  $python = file_exists("/usr/bin/python3")?"/usr/bin/python3":"/usr/bin/python";
 
 if (!$windows && !is_executable($python) && !$ctest)
-	die("ubertest needs python support; install python");
+	die("ubertest needs python support; install python\n");
 
 $cygwin = false;
 if ( $locals['scriptdir']!=$locals['testdir'] )
@@ -179,20 +178,39 @@ if ( $locals['scriptdir']!=$locals['testdir'] )
 	}
 }
 
-$index_script_path = $locals['scriptdir'].$index_data_path;
+global $index_data_prefix;
+$index_script_path = $locals['scriptdir'].$index_data_prefix;
 if (!file_exists ($index_script_path))
 	mkdir ($index_script_path);
 
-$index_data_path = $locals['testdir'].$index_data_path;
+$index_data_path = $locals['testdir'].$index_data_prefix;
 
 PublishLocals ( $locals, false );
 
-$sd_log				= testdir("searchd.log");
-$ss_log				= scriptdir("searchd.log");
-$sd_query_log		= testdir("query.log");
-$ss_query_log		= scriptdir("query.log");
-$sd_pid_file		= testdir("searchd.pid");
-$ss_pid_file		= scriptdir("searchd.pid");
+if ( !getenv("MANTICORE_MODULES") )
+{
+	$module_dirs = array (
+		$locals['testdir']."usr/share/manticore/modules",
+		"/usr/share/manticore/modules",
+	);
+
+	foreach ( $module_dirs as $module_dir )
+	{
+		if ( file_exists ( $module_dir."/lib_manticore_columnar.so" ) || file_exists ( $module_dir."/lib_manticore_columnar_avx2.so" ) )
+		{
+			putenv ( "MANTICORE_MODULES=".$module_dir );
+			break;
+		}
+	}
+}
+
+global $searchd_log, $query_log, $searchd_pid;
+$sd_log				= testdir($searchd_log);
+$ss_log				= scriptdir($searchd_log);
+$sd_query_log		= testdir($query_log);
+$ss_query_log		= scriptdir($query_log);
+$sd_pid_file		= testdir($searchd_pid);
+$ss_pid_file		= scriptdir($searchd_pid);
 
 require_once ( "helpers.inc" );
 
@@ -214,11 +232,15 @@ else
 if ( !$g_guesscached ) {
 	GuessRE2();
 	GuessICU();
+	GuessJieba();
 	GuessODBC();
 	GuessReplication();
 	GuessSSL();
 	GuessColumnar();
 	GuessSecondary();
+	GuessKNN();
+	GuessEmbeddings();
+	GuessZlib();
 	if ( !$force_guess )
 		CacheGuesses();
 }
@@ -226,7 +248,7 @@ if ( !$g_guesscached ) {
 if ( $g_locals["malloc-scribble"] )
 {
 	print ( "Malloc scribbling enabled.\n" );
-	putenv ( "MallocLogFile=/dev/null" );	
+	putenv ( "MallocLogFile=/dev/null" );
 	putenv ( "MallocScribble=1" );
 	putenv ( "MallocPreScribble=1" );
 	putenv ( "MallocGuardEdges=1" );
@@ -307,11 +329,11 @@ $sd_sphinxql_port_vip_ref = $sd_sphinxql_port_vip;
 $sd_http_port_ref = $sd_http_port;
 
 $name_err_all = $locals['scriptdir'] . "error_all.txt";
-$name_err = $locals['scriptdir'] . "error.txt";
+$name_err = $locals['scriptdir'] . error_txt();
 
 foreach ( $tests as $test )
 {
-	$res_path = scriptdir($test);
+	$res_path = resdir($test);
 	if ( $windows && !$sd_managed_searchd )
 	{
 		// avoid an issue with daemons stuck in exit(0) for some seconds
@@ -340,7 +362,7 @@ foreach ( $tests as $test )
 	{
 		$total_tests++;
 		$res = RunTest ( $test, $g_skipdemo, $g_usemarks );
-		
+
 		// copy searchd log into a file
 		file_put_contents($name_err_all, "\n*** in test $test ***\n", FILE_APPEND);
 		if ( file_exists ($name_err) )
@@ -393,14 +415,15 @@ foreach ( $tests as $test )
 }
 
 // cleanup
+global $config_base ;
 if ( !array_key_exists ('keep_all', $g_locals) )
 {
-	@unlink("config.conf");
-	@unlink("error.txt");
+	@unlink(config_conf());
+	@unlink(error_txt());
 
 	$nfile = 1;
-	while (file_exists("config_$nfile.conf")) {
-		@unlink("config_$nfile.conf");
+	while (file_exists("{$config_base}_$nfile.conf")) {
+		@unlink("{$config_base}_$nfile.conf");
 		$nfile++;
 	}
 

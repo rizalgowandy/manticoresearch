@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -45,7 +45,7 @@ const int				ROWITEM_BITS	= 8*sizeof(CSphRowitem);
 const int				ROWITEMPTR_BITS	= 8*sizeof(CSphRowitemPtr);
 const int				ROWITEM_SHIFT	= 5;
 
-STATIC_ASSERT ( ( 1 << ROWITEM_SHIFT )==ROWITEM_BITS, INVALID_ROWITEM_SHIFT );
+static_assert ( ( 1 << ROWITEM_SHIFT )==ROWITEM_BITS, "invalid ROWITEM_SHIFT" );
 
 #ifndef USE_LITTLE_ENDIAN
 #error Please define endianness
@@ -76,7 +76,7 @@ using DictRefPtr_c = CSphRefcountedPtr<CSphDict>;
 // DATASOURCES
 /////////////////////////////////////////////////////////////////////////////
 
-typedef uint64_t SphWordID_t;
+using SphWordID_t = uint64_t;
 STATIC_SIZE_ASSERT ( SphWordID_t, 8 );
 
 /// hit position storage type
@@ -184,7 +184,10 @@ enum ESphAggrFunc {
 	SPH_AGGR_MIN,
 	SPH_AGGR_MAX,
 	SPH_AGGR_SUM,
-	SPH_AGGR_CAT
+	SPH_AGGR_CAT,
+	SPH_AGGR_PERCENTILES,
+	SPH_AGGR_PERCENTILE_RANKS,
+	SPH_AGGR_MAD
 };
 
 
@@ -243,8 +246,6 @@ enum QueryOption_e
 enum ESphSortFunc
 {
 	FUNC_REL_DESC,
-	FUNC_ATTR_DESC,
-	FUNC_ATTR_ASC,
 	FUNC_TIMESEGS,
 	FUNC_GENERIC1,
 	FUNC_GENERIC2,

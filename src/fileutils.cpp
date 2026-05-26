@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -13,14 +13,12 @@
 #include "fileutils.h"
 #include "sphinxint.h"
 #include "std/crc32.h"
+#include <sys/stat.h>
 
 #if _WIN32
 	#define getcwd		_getcwd
-
 	#include <shlwapi.h>
 
-	#pragma comment(linker, "/defaultlib:ShLwApi.Lib")
-	#pragma message("Automatically linking with ShLwApi.Lib")
 #else
 	#include <glob.h>
 #endif
@@ -140,27 +138,26 @@ void sphLockUn ( int iFile )
 }
 #endif
 
-bool RawFileLock ( const CSphString& sFile, int& iLockFD, CSphString& sError )
+bool RawFileLock ( const CSphString & sFile, int & iLockFD, CSphString & sError )
 {
-	if ( iLockFD < 0 )
+	if ( iLockFD<0 )
 	{
-		iLockFD = ::open ( sFile.cstr(), SPH_O_NEW, 0644 );
-		if ( iLockFD < 0 )
+		iLockFD = ::open ( sFile.cstr (), SPH_O_NEW, 0644 );
+		if ( iLockFD<0 )
 		{
-			sError.SetSprintf ( "failed to open %s: %s", sFile.cstr(), strerrorm ( errno ) );
-			sphLogDebug ( "failed to open %s: %s", sFile.cstr(), strerrorm ( errno ) );
+			sError.SetSprintf ( "failed to open '%s': %u '%s'", sFile.cstr (), errno, strerrorm ( errno ) );
+			sphLogDebug ( "failed to open '%s': %u '%s'", sFile.cstr (), errno, strerrorm ( errno ) );
 			return false;
 		}
 	}
 
 	if ( !sphLockEx ( iLockFD, false ) )
 	{
-		sError.SetSprintf ( "failed to lock %s: %s", sFile.cstr(), strerrorm ( errno ) );
-		::close ( iLockFD );
-		iLockFD = -1;
+		sError.SetSprintf ( "failed to lock '%s': %u '%s'", sFile.cstr (), errno, strerrorm ( errno ) );
+		SafeClose ( iLockFD );
 		return false;
 	}
-	sphLogDebug ( "lock %s success", sFile.cstr() );
+	sphLogDebug ( "lock %s success", sFile.cstr () );
 	return true;
 }
 
@@ -170,9 +167,8 @@ void RawFileUnLock ( const CSphString& sFile, int& iLockFD )
 		return;
 	sphLogDebug ( "File ID ok, closing lock FD %d, unlinking %s", iLockFD, sFile.cstr() );
 	sphLockUn ( iLockFD );
-	::close ( iLockFD );
+	SafeClose ( iLockFD );
 	::unlink ( sFile.cstr() );
-	iLockFD = -1;
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -187,6 +183,26 @@ CSphIOStats * GetIOStats()
 	if ( !pIOStats || !pIOStats->IsEnabled() )
 		return nullptr;
 	return pIOStats;
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+namespace
+{
+	std::atomic<uint64_t> m_uGlobalWritten {0};
+}
+
+void GlobalWrite ( int iWritten ) noexcept
+{
+	if ( !iWritten )
+		return;
+
+	m_uGlobalWritten.fetch_add ( iWritten, std::memory_order_relaxed );
+}
+
+uint64_t GlobalWritten () noexcept
+{
+	return m_uGlobalWritten.load ( std::memory_order_relaxed );
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -350,6 +366,10 @@ bool sphFileExists ( const char * szFilename, CSphString * pError )
 	return true;
 }
 
+bool sphFileExists ( const CSphString& sFilename, CSphString* pError )
+{
+	return sphFileExists ( sFilename.cstr(), pError );
+}
 
 bool sphDirExists ( const char * szFilename, CSphString * pError )
 {
@@ -370,6 +390,11 @@ bool sphDirExists ( const char * szFilename, CSphString * pError )
 	}
 
 	return true;
+}
+
+bool sphDirExists ( const CSphString& sFilename, CSphString* pError )
+{
+	return sphDirExists ( sFilename.cstr(), pError );
 }
 
 
@@ -521,8 +546,8 @@ CSphString sphNormalizePath( const CSphString & sOrigPath )
 
 CSphString sphGetCwd()
 {
-	CSphVector<char> sBuf (65536);
-	return getcwd( sBuf.begin(), sBuf.GetLength());
+	CSphFixedVector<char> sBuf ( 65536 );
+	return getcwd ( sBuf.begin(), sBuf.GetLength() );
 }
 
 
@@ -837,6 +862,19 @@ const char * GetExtension ( const CSphString & sFullPath )
 }
 
 
+CSphString GetPathNoExtension ( const CSphString & sFullPath )
+{
+    if ( sFullPath.IsEmpty() )
+		return "";
+
+    const char * pDot = strchr ( sFullPath.cstr(), '.' );
+    if ( !pDot || pDot==sFullPath.cstr() )
+        return sFullPath.cstr();
+
+    return sFullPath.SubString ( 0, pDot-sFullPath.cstr() );
+}
+
+
 CSphString RealPath ( const CSphString& sPath )
 {
 #if _WIN32
@@ -862,6 +900,72 @@ CSphString RealPath ( const CSphString& sPath )
 #endif
 
 	return sPath;
+}
+
+
+std::pair<bool,bool> IsSymlink ( const CSphString & sFile )
+{
+#if _WIN32
+	DWORD uAttrs = GetFileAttributes ( sFile.cstr() );
+	if ( uAttrs==INVALID_FILE_ATTRIBUTES )
+		return { false, false };
+
+	if ( !( uAttrs & FILE_ATTRIBUTE_REPARSE_POINT ) )
+		return { false, false };
+
+	WIN32_FIND_DATA tFindData;
+	HANDLE hFind = FindFirstFile ( sFile.cstr(), &tFindData );
+	if ( hFind==INVALID_HANDLE_VALUE )
+		return { false, false };
+
+	bool bSymlink = tFindData.dwReserved0==IO_REPARSE_TAG_SYMLINK;
+	FindClose(hFind);
+
+	return { true, bSymlink };
+#else
+	struct_stat tStat = {0};
+
+	if ( lstat ( sFile.cstr(), &tStat ) )
+		return { false, false };	// not found
+
+	return { true, S_ISLNK(tStat.st_mode) };
+#endif
+}
+
+
+bool ResolveSymlink ( const CSphString & sFile, CSphString & sResult )
+{
+	sResult = sFile;
+
+#if _WIN32
+	HANDLE hFile = CreateFile ( sFile.cstr(), 0, 0, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr );
+	if ( hFile==INVALID_HANDLE_VALUE )
+		return false;
+
+	CHAR szTargetPath[MAX_PATH];
+	DWORD uBytesRead = GetFinalPathNameByHandle ( hFile, szTargetPath, MAX_PATH, FILE_NAME_NORMALIZED );
+	if ( uBytesRead )
+	{
+		sResult.SetBinary ( szTargetPath, uBytesRead );
+		if ( sResult.Begins ( R"(\\?\)" ) )
+			sResult = sResult.SubString ( 4, sResult.Length()-4 );
+
+		return true;
+	}
+
+	CloseHandle(hFile);
+	return false;
+#else
+	char szPath[PATH_MAX];
+	ssize_t tLen = ::readlink ( sFile.cstr(), szPath, sizeof(szPath)-1 );
+	if ( tLen!=-1 )
+	{
+		sResult = CSphString ( szPath, tLen );
+		return true;
+	}
+
+	return false;
+#endif
 }
 
 
@@ -902,4 +1006,159 @@ void SeekAndPutOffset ( CSphWriter & tWriter, SphOffset_t tOffset, SphOffset_t t
 	tWriter.SeekTo(tOffset); 
 	tWriter.PutOffset(tValue);
 	tWriter.SeekTo(tTotalSize);
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+SharedMemory_c::SharedMemory_c ( const CSphString & sPath )
+	: m_sPath ( sPath )
+{
+}
+
+SharedMemory_c::~SharedMemory_c()
+{
+	if ( m_sPath.IsEmpty() )
+		return;
+
+#ifndef _WIN32
+	if ( !Close() )
+		sphFatalLog ( "%s", m_sError.cstr() );
+#endif
+}
+
+SharedMemory_c::OpenResult_e SharedMemory_c::Open()
+{
+	if ( m_sPath.IsEmpty() )
+	{
+		m_sError.SetSprintf ( "empty path to shared memory" );
+		return SharedMemory_c::OpenResult_e::FAILURE;
+	}
+
+	if ( !Close() )
+		return SharedMemory_c::OpenResult_e::FAILURE;
+
+	int iFD = -1;
+	int64_t iBytes = 0;
+#ifndef _WIN32
+
+	iFD = ::shm_open ( m_sPath.cstr(), O_RDWR | O_EXCL, 0644 );
+	if ( iFD==-1 )
+	{
+		m_sError.SetSprintf ( "failed to open shared memory %s: %s" , m_sPath.cstr(), strerror(errno) );
+		return SharedMemory_c::OpenResult_e::NO_FILE;
+	}
+	m_bHasFile = true;
+
+	iBytes = sphGetFileSize ( iFD, &m_sError );
+	if ( iBytes==-1 )
+		return SharedMemory_c::OpenResult_e::FAILURE;
+
+#endif
+	bool bOk = MapFile ( iFD, iBytes );
+	return ( bOk ? SharedMemory_c::OpenResult_e::OK : SharedMemory_c::OpenResult_e::FAILURE );
+}
+
+bool SharedMemory_c::Create ( int64_t iBytes )
+{
+	if ( !Close () )
+		return false;
+
+	int iFD = -1;
+#ifndef _WIN32
+
+	iFD = ::shm_open ( m_sPath.cstr(), O_CREAT | O_RDWR | O_EXCL, 0644 );
+	if ( iFD==-1 )
+	{
+		m_sError.SetSprintf ( "failed to open shared memory %s: %s" , m_sPath.cstr(), strerror(errno) );
+		return false;
+	}
+	m_bHasFile = true;
+
+	if ( ::ftruncate ( iFD, iBytes)==-1 )
+	{
+		m_sError.SetSprintf ( "failed to set size " INT64_FMT " for shared memory %s: %s" , iBytes, m_sPath.cstr(), strerror(errno) );
+		SafeClose ( iFD );
+		Close ();
+		return false;
+	}
+#endif
+	return MapFile ( iFD, iBytes );
+}
+
+bool SharedMemory_c::Reset ( int64_t iBytes )
+{
+	if ( !Close() )
+		return false;
+
+	return Create ( iBytes );
+}
+
+bool SharedMemory_c::Close ()
+{
+	if ( !IsValid() )
+		return false;
+
+#ifndef _WIN32
+	if ( m_pData )
+		::munmap ( m_pData, m_iCount );
+
+	m_pData = nullptr;
+	m_iCount = 0;
+	bool bCloseFile = m_bHasFile;
+	m_bHasFile = false;
+
+	if ( bCloseFile && ::shm_unlink ( m_sPath.cstr() )==-1 )
+	{
+		m_sError.SetSprintf ( "failed to unlink shared memory %s: %s" , m_sPath.cstr(), strerror(errno) );
+		return false;
+	}
+#endif
+	return true;
+}
+
+bool SharedMemory_c::MapFile ( int iFD, int64_t iBytes )
+{
+#ifndef _WIN32
+	BYTE * pData = (BYTE *)::mmap ( nullptr, iBytes, PROT_WRITE | PROT_READ, MAP_SHARED, iFD, 0 );
+	if ( pData==MAP_FAILED )
+	{
+		m_sError.SetSprintf ( "failed to mmap size " INT64_FMT " for shared memory %s: %s" , iBytes, m_sPath.cstr(), strerror(errno) );
+		SafeClose ( iFD );
+		Close();
+		return false;
+	}
+
+	SafeClose ( iFD );
+	mmadvise ( pData, iBytes, Advise_e::NOFORK );
+	mmadvise ( pData, iBytes, Advise_e::NODUMP );
+
+	m_pData = pData;
+	m_iCount = iBytes;
+#endif
+	return true;
+}
+
+bool SharedMemory_c::IsValid()
+{
+#ifdef _WIN32
+	m_sError = "shared memory unsupported";
+	return false;
+#else
+	if ( m_sPath.IsEmpty() )
+	{
+		m_sError = "empty path to shared memory";
+		return false;
+	}
+
+	return true;
+#endif
+}
+
+bool SharedMemory_c::IsSupported () const
+{
+#ifdef _WIN32
+	return false;
+#else
+	return true;
+#endif
 }

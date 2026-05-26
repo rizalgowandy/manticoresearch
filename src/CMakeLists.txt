@@ -19,15 +19,19 @@ message ( STATUS "Inside directory src..." )
 
 # columnar and secondary modules
 include ( GetColumnar )
-target_link_libraries ( lextra INTERFACE columnar::columnar_api columnar::secondary_api)
+target_link_libraries ( lextra INTERFACE columnar::columnar_api columnar::secondary_api columnar::knn_api )
 
 # check if we have correct columnar api
 set_property ( TARGET lextra PROPERTY INTERFACE_COLUMNAR_API_VERSION ${NEED_COLUMNAR_API} )
 set_property ( TARGET lextra APPEND PROPERTY COMPATIBLE_INTERFACE_STRING COLUMNAR_API_VERSION )
 
-# check if we have correct columnar api
+# check if we have correct secondary api
 set_property ( TARGET lextra PROPERTY INTERFACE_SECONDARY_API_VERSION ${NEED_SECONDARY_API} )
 set_property ( TARGET lextra APPEND PROPERTY COMPATIBLE_INTERFACE_STRING SECONDARY_API_VERSION )
+
+# check if we have correct knn api
+set_property ( TARGET lextra PROPERTY INTERFACE_KNN_API_VERSION ${NEED_KNN_API} )
+set_property ( TARGET lextra APPEND PROPERTY COMPATIBLE_INTERFACE_STRING KNN_API_VERSION )
 
 target_include_directories ( lextra INTERFACE ${CMAKE_CURRENT_SOURCE_DIR} )
 get_banner ( CONFIGURE_FLAGS )
@@ -47,52 +51,67 @@ add_library ( generated_config INTERFACE )
 target_include_directories ( generated_config INTERFACE "${MANTICORE_BINARY_DIR}/config" )
 target_link_libraries ( lextra INTERFACE generated_config )
 
-# main bunch of sources (for libsphinx)
-add_library ( lmanticore STATIC sphinx.cpp sphinxexcerpt.cpp sphinxquery.cpp sphinxutils.cpp
-		sphinxsort.cpp sortsetup.cpp sphinxexpr.cpp sphinxfilter.cpp sphinxsearch.cpp sphinxrt.cpp accumulator.cpp
-		sphinxjson.cpp sphinxaot.cpp sphinxplugin.cpp sphinxudf.c sphinxqcache.cpp sphinxjsonquery.cpp
-		jsonqueryfilter.cpp attribute.cpp secondaryindex.cpp killlist.cpp searchnode.cpp json/cJSON.c sphinxpq.cpp
-		global_idf.cpp docstore.cpp lz4/lz4.c lz4/lz4hc.c searchdexpr.cpp snippetfunctor.cpp snippetindex.cpp
-		snippetstream.cpp snippetpassage.cpp threadutils.cpp sphinxversion.cpp indexcheck.cpp datareader.cpp
-		indexformat.cpp indexsettings.cpp fileutils.cpp threads_detached.cpp hazard_pointer.cpp
-		task_info.cpp mini_timer.cpp fileio.cpp memio.cpp queryprofile.cpp columnarfilter.cpp columnargrouper.cpp
-		columnarlib.cpp collation.cpp histogram.cpp threads_detached.cpp hazard_pointer.cpp
-		timeout_queue.cpp dynamic_idx.cpp columnarrt.cpp columnarmisc.cpp exprtraits.cpp columnarexpr.cpp
-		sphinx_alter.cpp columnarsort.cpp binlog.cpp chunksearchctx.cpp client_task_info.cpp
-		indexfiles.cpp indexfilebase.cpp attrindex_builder.cpp queryfilter.cpp aggregate.cpp secondarylib.cpp costestimate.cpp
-		docidlookup.cpp tracer.cpp attrindex_merge.cpp )
+add_library ( lmanticore_coro OBJECT coroutine.cpp coro_stack.cpp task_dispatcher.cpp coroutine.h coro_stack.h coro_waker.h task_dispatcher.h )
+target_link_libraries ( lmanticore_coro PRIVATE lextra )
 
-add_library ( lstem STATIC sphinxsoundex.cpp sphinxmetaphone.cpp sphinxstemen.cpp sphinxstemru.cpp sphinxstemru.inl
-		sphinxstemcz.cpp sphinxstemar.cpp )
-target_link_libraries ( lstem PUBLIC lextra )
-
-add_library ( conversion conversion.cpp )
-target_link_libraries ( conversion PUBLIC lextra )
-
-target_link_libraries ( lmanticore PUBLIC conversion )
+add_library ( conversion OBJECT conversion.cpp )
+target_link_libraries ( conversion PRIVATE lextra )
 
 add_subdirectory ( std )
-target_link_libraries ( lmanticore PUBLIC manticore_std )
-
 add_subdirectory ( stripper )
-target_link_libraries ( lmanticore PUBLIC stripper )
-
 add_subdirectory ( tokenizer )
-target_link_libraries ( lmanticore PUBLIC tokenizer )
-target_link_libraries ( lmanticore PUBLIC lextra )
-
 add_subdirectory ( schema )
-target_link_libraries ( lmanticore PUBLIC schema )
-
 add_subdirectory ( dict )
-target_link_libraries ( lmanticore PUBLIC dict )
+add_subdirectory ( sphinxquery )
+add_subdirectory ( indexing_sources )
 
-add_library ( lmanticore_icu icu.cpp )
-if (WITH_ICU)
-	target_link_libraries ( lmanticore_icu PRIVATE icu::icu )
+# main bunch of sources (for libsphinx)
+add_library ( lmanticore STATIC sphinx.cpp sphinxutils.cpp
+		sphinxsort.cpp sortsetup.cpp sphinxexpr.cpp sphinxfilter.cpp sphinxsearch.cpp sphinxrt.cpp accumulator.cpp
+		sphinxjson.cpp sphinxaot.cpp sphinxplugin.cpp sphinxudf.c sphinxqcache.cpp 
+		attribute.cpp secondaryindex.cpp killlist.cpp searchnode.cpp json/cJSON_test.c sphinxpq.cpp
+		global_idf.cpp docstore.cpp lz4/lz4.c lz4/lz4hc.c snippetfunctor.cpp snippetindex.cpp
+		snippetstream.cpp snippetpassage.cpp threadutils.cpp sphinxversion.cpp datareader.cpp
+		indexformat.cpp indexsettings.cpp fileutils.cpp threads_detached.cpp hazard_pointer.cpp
+		task_info.cpp mini_timer.cpp fileio.cpp memio.cpp queryprofile.cpp columnarfilter.cpp columnargrouper.cpp
+		columnarlib.cpp collation.cpp histogram.cpp
+		timeout_queue.cpp columnarrt.cpp columnarmisc.cpp exprtraits.cpp columnarexpr.cpp
+		sphinx_alter.cpp columnarsort.cpp binlog.cpp chunksearchctx.cpp client_task_info.cpp
+		indexfiles.cpp indexfilebase.cpp attrindex_builder.cpp queryfilter.cpp aggregate.cpp secondarylib.cpp costestimate.cpp
+		docidlookup.cpp tracer.cpp attrindex_merge.cpp distinct.cpp hyperloglog.cpp pseudosharding.cpp geodist.cpp
+		datetime.cpp grouper.cpp exprdatetime.cpp detail/indexlink.cpp knnmisc.cpp knnlib.cpp libutils.cpp
+		aggrexpr.cpp joinsorter.cpp queuecreator.cpp exprgeodist.cpp exprremap.cpp exprdocstore.cpp schematransform.cpp
+		attr_embedding.cpp embeddingutils.cpp hybridexecutor.cpp
+		sortergroup.cpp sortertraits.cpp sorterprecalc.cpp querycontext.cpp skip_cache.cpp jsonsi.cpp sorterscroll.cpp )
+
+if (WIN32)
+target_link_libraries ( lmanticore PRIVATE dbghelp AdvAPI32 ShLwApi )
+endif()
+
+include ( GetRBitmap )
+add_library ( indexcheck OBJECT indexcheck.cpp indexcheck.h )
+target_link_libraries ( indexcheck PRIVATE lextra roaring::roaring )
+target_link_libraries ( lmanticore PUBLIC indexcheck )
+
+target_link_libraries ( lmanticore PUBLIC lextra indexcheck conversion manticore_std stripper tokenizer
+		schema dict sphinxquery sourcedoc lmanticore_coro )
+
+if (WITH_ICU OR WITH_JIEBA)
+	add_library ( lcjk cjkpreprocessor.cpp )
+	target_link_libraries ( lcjk PUBLIC lextra )
+
+	if (WITH_ICU)
+		add_library ( lmanticore_icu icu.cpp )
+		target_link_libraries ( lmanticore_icu PRIVATE icu::icu lcjk )
+		target_link_libraries ( lmanticore PUBLIC lmanticore_icu )
+	endif ()
+
+	if (WITH_JIEBA)
+		add_library ( lmanticore_jieba jieba.cpp jieba.h )
+		target_link_libraries ( lmanticore_jieba PRIVATE jieba::jieba lcjk )
+		target_link_libraries ( lmanticore PUBLIC lmanticore_jieba )
+	endif ()
 endif ()
-target_link_libraries ( lmanticore_icu PRIVATE lextra )
-target_link_libraries ( lmanticore PUBLIC lmanticore_icu )
 
 if (WITH_STEMMER)
 	target_link_libraries ( lmanticore PRIVATE stemmer::stemmer )
@@ -101,14 +120,13 @@ if (WITH_RE2)
 	target_link_libraries ( lmanticore PRIVATE re2::re2 )
 endif ()
 
-add_subdirectory ( indexing_sources )
-target_link_libraries ( lmanticore PUBLIC sourcedoc )
-
 if (WIN32)
-	target_sources ( lmanticore PRIVATE libutils.cpp )
 	if (NOT CMAKE_CROSSCOMPILING)
 		target_compile_options ( lmanticore PRIVATE /bigobj )
 	endif ()
+endif ()
+if (NOT WIN32)
+	add_lib_for ( shm_open rt lmanticore )
 endif ()
 
 # Boost is required dependency now
@@ -129,140 +147,84 @@ target_link_libraries ( lextra INTERFACE Boost::boost Boost::context )
 # (we don't link with fiber since our custom build dockers doesn't include it, and they need to be rebuilt before)
 target_compile_definitions ( lextra INTERFACE BOOST_ALL_NO_LIB=1 )
 
-add_library ( lmanticore_coro coroutine.cpp coro_stack.cpp task_dispatcher.cpp coroutine.h coro_stack.h coro_waker.h task_dispatcher.h)
-target_link_libraries ( lmanticore_coro PUBLIC lextra )
-
-target_link_libraries ( lmanticore PUBLIC lmanticore_coro )
-
-set ( LMANTICORE_BISON sphinxexpr.y sphinxselect.y sphinxquery.y sphinxjson.y )
-set ( LMANTICORE_FLEX sphinxjson.l sphinxexpr.l )
-set ( SEARCHD_BISON sphinxql.y sphinxql_debug.y ddl.y sphinxql_second.y sphinxql_extra.y)
-set ( SEARCHD_FLEX sphinxql.l sphinxql_debug.l ddl.l sphinxql_second.l sphinxql_extra.l)
-
 # The headers is not neccessary for executable build, but nesessary for MSVC and other projects
 # all the (non-generated) headers
 # So if you add headers to the project and NOT see them in visual studio solution - just list them here!
-set ( HEADERS sphinxexcerpt.h sphinxfilter.h sphinxint.h sphinxjsonquery.h sphinxpq.h sphinxql_debug.h sphinxrt.h
-		sphinxsort.h sphinxstem.h sphinxutils.h sphinxexpr.h sphinx.h sphinxjson.h sphinxplugin.h sphinxqcache.h
-		sphinxquery.h sphinxsearch.h sphinxstd.h sphinxudf.h lz4/lz4.h lz4/lz4hc.h http/http_parser.h secondaryindex.h
+set ( HEADERS sphinxfilter.h sphinxint.h sphinxpq.h sphinxrt.h
+		sphinxsort.h sphinxutils.h sphinxexpr.h sphinx.h sphinxjson.h sphinxplugin.h sphinxqcache.h
+		sphinxsearch.h sphinxstd.h sphinxudf.h lz4/lz4.h lz4/lz4hc.h http/http_parser.h secondaryindex.h
 		searchnode.h killlist.h attribute.h accumulator.h global_idf.h event.h threadutils.h threadutils_impl.h
-		hazard_pointer.h task_info.h mini_timer.h collation.h histogram.h sortsetup.h dynamic_idx.h sphinxql_second.h sphinxql_extra.h
+		hazard_pointer.h task_info.h mini_timer.h collation.h histogram.h sortsetup.h
 		indexsettings.h columnarlib.h fileio.h memio.h memio_impl.h queryprofile.h columnarfilter.h columnargrouper.h fileutils.h
 		libutils.h conversion.h columnarsort.h sortcomp.h binlog_defs.h binlog.h ${MANTICORE_BINARY_DIR}/config/config.h
 		chunksearchctx.h indexfilebase.h indexfiles.h attrindex_builder.h queryfilter.h aggregate.h secondarylib.h
-		costestimate.h docidlookup.h tracer.h attrindex_merge.h columnarmisc.h )
+		costestimate.h docidlookup.h tracer.h attrindex_merge.h columnarmisc.h distinct.h hyperloglog.h pseudosharding.h datetime.h
+		grouper.h exprdatetime.h geodist.h detail/indexlink.h detail/expmeter.h knnmisc.h knnlib.h match_impl.h std/string_impl.h
+		aggrexpr.h joinsorter.h queuecreator.h exprgeodist.h exprremap.h exprdocstore.h schematransform.h attr_embedding.h embeddingutils.h hybridexecutor.h sortergroup.h
+		sortertraits.h sorterprecalc.h querycontext.h skip_cache.h jsonsi.h jieba.h cjkpreprocessor.h sorterscroll.h )
 
 set ( SEARCHD_H searchdaemon.h searchdconfig.h searchdddl.h searchdexpr.h searchdha.h searchdreplication.h searchdsql.h
 		searchdtask.h client_task_info.h taskflushattrs.h taskflushbinlog.h taskflushmutable.h taskglobalidf.h
-		taskmalloctrim.h taskoptimize.h taskping.h taskpreread.h tasksavestate.h net_action_accept.h
+		taskmalloctrim.h taskping.h taskpreread.h tasksavestate.h net_action_accept.h
 		netreceive_api.h netreceive_http.h netreceive_ql.h networking_daemon.h query_status.h
-		compressed_zlib_mysql.h sphinxql_debug.h stackmock.h replication/wsrep_api_stub.h searchdssl.h digest_sha1.h
+		compressed_zlib_mysql.h sphinxql_debug.h stackmock.h searchdssl.h digest_sha1.h
 		client_session.h compressed_zstd_mysql.h docs_collector.h index_rotator.h config_reloader.h searchdhttp.h timeout_queue.h
-		netpoll.h pollable_event.h netfetch.h searchdbuddy.h sphinxql_second.h sphinxql_extra.h)
+		netpoll.h pollable_event.h netfetch.h searchdbuddy.h sphinxql_second.h sphinxql_extra.h sphinxjsonquery.h
+		frontendschema.h debug_cmds.h dynamic_idx.h sphinxexcerpt.h querystats.h
+		facetutils.h
+		)
 
-source_group ( "Grammar sources" FILES ${LMANTICORE_BISON} ${SEARCHD_BISON} )
-source_group ( "Lexer sources" FILES ${LMANTICORE_FLEX} ${SEARCHD_FLEX} )
 
 # add the extra targets in the case we want on-the-fly grammar compiler
-find_package ( BISON REQUIRED )
-set ( BISON_DIR "${MANTICORE_BINARY_DIR}/config" )
-set ( BIS_FLAGS "" )
-if (BISON_VERSION VERSION_GREATER 3.0)
-	set ( BIS_FLAGS "-Wno-deprecated" )
-endif ()
+include (mybison)
 
-BISON_TARGET ( ExprParser "${CMAKE_CURRENT_SOURCE_DIR}/sphinxexpr.y" ${BISON_DIR}/bissphinxexpr.c COMPILE_FLAGS ${BIS_FLAGS} )
-BISON_TARGET ( SelectParser "${CMAKE_CURRENT_SOURCE_DIR}/sphinxselect.y" ${BISON_DIR}/bissphinxselect.c COMPILE_FLAGS ${BIS_FLAGS} )
-BISON_TARGET ( QueryParser "${CMAKE_CURRENT_SOURCE_DIR}/sphinxquery.y" ${BISON_DIR}/bissphinxquery.c COMPILE_FLAGS ${BIS_FLAGS} )
-BISON_TARGET ( SQLParser "${CMAKE_CURRENT_SOURCE_DIR}/sphinxql.y" ${BISON_DIR}/bissphinxql.c COMPILE_FLAGS ${BIS_FLAGS} )
-BISON_TARGET ( DDLParser "${CMAKE_CURRENT_SOURCE_DIR}/ddl.y" ${BISON_DIR}/bisddl.c COMPILE_FLAGS ${BIS_FLAGS} )
-BISON_TARGET ( JsonParser "${CMAKE_CURRENT_SOURCE_DIR}/sphinxjson.y" ${BISON_DIR}/bissphinxjson.c COMPILE_FLAGS ${BIS_FLAGS} )
-BISON_TARGET ( SQLDebugParser "${CMAKE_CURRENT_SOURCE_DIR}/sphinxql_debug.y" ${BISON_DIR}/bissphinxql_debug.c COMPILE_FLAGS ${BIS_FLAGS} )
-BISON_TARGET ( SQLSecondParser "${CMAKE_CURRENT_SOURCE_DIR}/sphinxql_second.y" ${BISON_DIR}/bissphinxql_second.c COMPILE_FLAGS ${BIS_FLAGS} )
-BISON_TARGET ( SQLExtraParser "${CMAKE_CURRENT_SOURCE_DIR}/sphinxql_extra.y" ${BISON_DIR}/bissphinxql_extra.c COMPILE_FLAGS ${BIS_FLAGS} )
-
-set_source_files_properties ( sphinxexpr.cpp PROPERTIES OBJECT_DEPENDS ${BISON_ExprParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
-set_source_files_properties ( sphinx.cpp PROPERTIES OBJECT_DEPENDS ${BISON_SelectParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
-set_source_files_properties ( sphinxquery.cpp PROPERTIES OBJECT_DEPENDS ${BISON_QueryParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
-set_source_files_properties ( sphinxjson.cpp PROPERTIES OBJECT_DEPENDS ${BISON_JsonParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
-set_source_files_properties ( searchdddl.cpp PROPERTIES OBJECT_DEPENDS ${BISON_DDLParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
-set_source_files_properties ( searchdsql.cpp PROPERTIES OBJECT_DEPENDS ${BISON_SQLParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
-set_source_files_properties ( sphinxql_debug.cpp PROPERTIES OBJECT_DEPENDS ${BISON_SQLDebugParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
-set_source_files_properties ( sphinxql_second.cpp PROPERTIES OBJECT_DEPENDS ${BISON_SQLSecondParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
-set_source_files_properties ( sphinxql_extra.cpp PROPERTIES OBJECT_DEPENDS ${BISON_SQLExtraParser_OUTPUT_SOURCE} SKIP_UNITY_BUILD_INCLUSION ON )
+MY_BISON ( ExprParser sphinxexpr sphinxexpr.cpp LMANTICORE )
+MY_BISON ( SelectParser sphinxselect sphinx.cpp LMANTICORE )
+MY_BISON ( JsonParser sphinxjson sphinxjson.cpp LMANTICORE )
+MY_BISON ( SQLParser sphinxql searchdsql.cpp SEARCHD )
+MY_BISON ( DDLParser ddl searchdddl.cpp SEARCHD )
+MY_BISON ( SQLDebugParser sphinxql_debug sphinxql_debug.cpp SEARCHD )
+MY_BISON ( SQLSecondParser sphinxql_second sphinxql_second.cpp SEARCHD )
+MY_BISON ( SQLExtraParser sphinxql_extra sphinxql_extra.cpp SEARCHD )
+source_group ( "Grammar sources" FILES ${LMANTICORE_BISON} ${SEARCHD_BISON} )
 
 # add the extra targets in the case we want on-the-fly lex compiler
-find_package ( FLEX REQUIRED )
-set ( FLEX_DIR "${MANTICORE_BINARY_DIR}/config" )
-FLEX_TARGET ( SQLlex "${CMAKE_CURRENT_SOURCE_DIR}/sphinxql.l" ${FLEX_DIR}/flexsphinxql.c )
-FLEX_TARGET ( Jsonlex "${CMAKE_CURRENT_SOURCE_DIR}/sphinxjson.l" ${FLEX_DIR}/flexsphinxjson.c )
-FLEX_TARGET ( Exprlex "${CMAKE_CURRENT_SOURCE_DIR}/sphinxexpr.l" ${FLEX_DIR}/flexsphinxexpr.c )
-FLEX_TARGET ( DDLlex "${CMAKE_CURRENT_SOURCE_DIR}/ddl.l" ${FLEX_DIR}/flexddl.c )
-FLEX_TARGET ( SQLDebuglex "${CMAKE_CURRENT_SOURCE_DIR}/sphinxql_debug.l" ${FLEX_DIR}/flexsphinxqldebug.c )
-FLEX_TARGET ( SQLSecondlex "${CMAKE_CURRENT_SOURCE_DIR}/sphinxql_second.l" ${FLEX_DIR}/flexsphinxqlsecond.c )
-FLEX_TARGET ( SQLExtralex "${CMAKE_CURRENT_SOURCE_DIR}/sphinxql_extra.l" ${FLEX_DIR}/flexsphinxqlextra.c )
+MY_FLEX ( Jsonlex sphinxjson sphinxjson.cpp LMANTICORE )
+MY_FLEX ( Exprlex sphinxexpr sphinxexpr.cpp LMANTICORE )
+MY_FLEX ( SQLlex sphinxql searchdsql.cpp SEARCHD )
+MY_FLEX ( DDLlex ddl searchdddl.cpp SEARCHD )
+MY_FLEX ( SQLDebuglex sphinxql_debug sphinxql_debug.cpp SEARCHD )
+MY_FLEX ( SQLSecondlex sphinxql_second sphinxql_second.cpp SEARCHD )
+MY_FLEX ( SQLExtralex sphinxql_extra sphinxql_extra.cpp SEARCHD )
+source_group ( "Lexer sources" FILES ${LMANTICORE_FLEX} ${SEARCHD_FLEX} )
 
-set_property ( SOURCE searchdsql.cpp APPEND PROPERTY OBJECT_DEPENDS ${FLEX_SQLlex_OUTPUTS} )
-set_property ( SOURCE searchdddl.cpp APPEND PROPERTY OBJECT_DEPENDS ${FLEX_DDLlex_OUTPUTS} )
-set_property ( SOURCE sphinxjson.cpp APPEND PROPERTY OBJECT_DEPENDS ${FLEX_Jsonlex_OUTPUTS} )
-set_property ( SOURCE sphinxexpr.cpp APPEND PROPERTY OBJECT_DEPENDS ${FLEX_Exprlex_OUTPUTS} )
-set_property ( SOURCE sphinxql_debug.cpp APPEND PROPERTY OBJECT_DEPENDS ${FLEX_SQLDebuglex_OUTPUTS} )
-set_property ( SOURCE sphinxql_second.cpp APPEND PROPERTY OBJECT_DEPENDS ${FLEX_SQLSecondlex_OUTPUTS} )
-set_property ( SOURCE sphinxql_extra.cpp APPEND PROPERTY OBJECT_DEPENDS ${FLEX_SQLExtralex_OUTPUTS} )
+diag ( LMANTICORE_BISON SEARCHD_BISON LMANTICORE_FLEX SEARCHD_FLEX )
 
 # our mega-lib
 target_sources ( lmanticore PUBLIC ${LMANTICORE_BISON} ${LMANTICORE_FLEX} ${HEADERS} ${CHARSET_FILES} ${CHARSET_TEMPLATE} "../misc/manticore.natvis" )
 target_link_libraries ( lmanticore PUBLIC uni-algo::uni-algo )
 
 add_library ( lsearchd OBJECT searchdha.cpp http/http_parser.c searchdhttp.cpp
-		searchdtask.cpp taskping.cpp taskmalloctrim.cpp taskoptimize.cpp taskglobalidf.cpp tasksavestate.cpp
+		searchdtask.cpp taskping.cpp taskmalloctrim.cpp taskglobalidf.cpp tasksavestate.cpp
 		taskflushbinlog.cpp taskflushattrs.cpp taskflushmutable.cpp taskpreread.cpp
 		searchdaemon.cpp searchdfields.cpp searchdconfig.cpp
 		searchdsql.cpp searchdddl.cpp networking_daemon.cpp
 		net_action_accept.cpp netreceive_api.cpp
 		netreceive_http.cpp netreceive_ql.cpp query_status.cpp
 		sphinxql_debug.cpp sphinxql_second.cpp stackmock.cpp docs_collector.cpp index_rotator.cpp config_reloader.cpp netpoll.cpp
-		pollable_event.cpp netfetch.cpp searchdbuddy.cpp searchdhttpcompat.cpp sphinxql_extra.cpp)
+		pollable_event.cpp netfetch.cpp searchdbuddy.cpp searchdhttpcompat.cpp sphinxql_extra.cpp searchdreplication.cpp sphinxjsonquery.cpp
+		frontendschema.cpp compressed_http.cpp debug_cmds.cpp jsonqueryfilter.cpp dynamic_idx.cpp sphinxexcerpt.cpp searchdexpr.cpp querystats.cpp
+		facetutils.cpp
+		)
 target_sources ( lsearchd PUBLIC ${SEARCHD_SRCS_TESTABLE} ${SEARCHD_H} ${SEARCHD_BISON} ${SEARCHD_FLEX} )
 add_library ( digest_sha1 digest_sha1.cpp )
 target_link_libraries ( digest_sha1 PRIVATE lextra )
-target_link_libraries ( lsearchd PUBLIC digest_sha1 lextra nlohmann_json::nlohmann_json )
+add_subdirectory ( sqlchecks )
+target_link_libraries ( lsearchd PUBLIC sqlchecks digest_sha1 lextra nlohmann_json::nlohmann_json )
 target_link_libraries ( lsearchd INTERFACE Boost::filesystem )
-
-if (WITH_CURL)
-	if (DL_CURL)
-		target_link_libraries ( lsearchd PRIVATE CURL::libcurl_ld )
-	else ()
-		target_link_libraries ( lsearchd PRIVATE CURL::libcurl )
-	endif ()
-endif ()
-
-function (stackmock processors compiler versions config values)
-	if (NOT CMAKE_SYSTEM_PROCESSOR IN_LIST processors)
-		return()
-	endif()
-
-	if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "${compiler}")
-		return()
-	endif()
-
-	if (NOT CMAKE_CXX_COMPILER_VERSION IN_LIST versions)
-		return()
-	endif()
-
-	string ( TOUPPER ${config} CONFIGUPPER )
-	diags ( "Set ${values} for ${CMAKE_SYSTEM_PROCESSOR}, ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} config ${config}")
-	set_source_files_properties ( stackmock.cpp PROPERTIES COMPILE_DEFINITIONS_${CONFIGUPPER} "${values}" )
-endfunction()
-
-diag ( CMAKE_SYSTEM_PROCESSOR CMAKE_CXX_COMPILER_ID CMAKE_CXX_COMPILER_VERSION )
-stackmock ( "x86_64;amd64" Clang "12;13;13.0.1" relwithdebinfo "KNOWN_CREATE_SIZE=768;KNOWN_EXPR_SIZE=32;KNOWN_FILTER_SIZE=224" )
-stackmock ( "x86_64;amd64" Clang "12;13;13.0.1" debug "KNOWN_CREATE_SIZE=4208;KNOWN_EXPR_SIZE=48;KNOWN_FILTER_SIZE=400" )
-stackmock ( "x86_64;amd64" Clang "15.0.2" relwithdebinfo "KNOWN_CREATE_SIZE=208;KNOWN_EXPR_SIZE=32;KNOWN_FILTER_SIZE=128" )
-stackmock ( "x86_64;amd64" Clang "15.0.4;15.0.6" relwithdebinfo "KNOWN_CREATE_SIZE=208;KNOWN_EXPR_SIZE=96;KNOWN_FILTER_SIZE=304" )
-stackmock ( "x86_64;amd64" Clang "15.0.2;15.0.4;15.0.6" debug "KNOWN_CREATE_SIZE=1936;KNOWN_EXPR_SIZE=48;KNOWN_FILTER_SIZE=368" )
-stackmock ( "x86_64;amd64" GNU "9.3;9.4" relwithdebinfo "KNOWN_CREATE_SIZE=16;KNOWN_EXPR_SIZE=48;KNOWN_FILTER_SIZE=240" )
-stackmock ( "x86_64;amd64" GNU "9.3;9.4" debug "KNOWN_CREATE_SIZE=256;KNOWN_EXPR_SIZE=48;KNOWN_FILTER_SIZE=272" )
+if (WIN32)
+target_link_libraries ( lsearchd PRIVATE iphlpapi WS2_32 wsock32 )
+endif()
 
 if (WITH_ZLIB OR WITH_ZSTD)
 	target_sources ( lsearchd PRIVATE compressed_mysql_layer.cpp compressed_mysql_layer.h )
@@ -281,35 +243,36 @@ if (WITH_ZLIB OR WITH_ZSTD)
 	endif ()
 endif ()
 
+if (WITH_CURL)
+	if (DL_CURL)
+		target_link_libraries ( lsearchd PRIVATE CURL::libcurl_ld )
+	else ()
+		target_link_libraries ( lsearchd PRIVATE CURL::libcurl )
+	endif ()
+endif ()
+
 add_subdirectory ( perfetto )
-target_link_libraries ( lextra INTERFACE perfetto )
+if (TARGET perfetto)
+	target_link_libraries ( lextra INTERFACE perfetto )
+endif()
 
 # stub library for all except daemon - to avoid link with openssl
-add_library ( stub_ssl searchdssl.cpp )
+add_library ( stub_ssl searchdssl_stub.cpp )
 target_link_libraries ( stub_ssl PRIVATE lextra )
 
 # support for ssl. Actual only for physical daemon
 add_library ( searchd_ssl searchdssl.cpp )
 target_link_libraries ( searchd_ssl PUBLIC lextra )
 if (WITH_SSL)
-	target_compile_definitions ( searchd_ssl PRIVATE DAEMON )
 	target_link_libraries ( searchd_ssl PRIVATE OpenSSL::SSL )
+	target_link_libraries ( searchd_ssl PRIVATE OpenSSL::Crypto )
 	target_link_libraries ( digest_sha1 PRIVATE OpenSSL::SSL )
+	target_link_libraries ( digest_sha1 PRIVATE OpenSSL::Crypto )
+	if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux" OR ${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
+		target_link_options ( searchd_ssl INTERFACE $<${ONLYGNUCLANGC_CXX}:-Wl,--exclude-libs,libssl.a,--exclude-libs,libcrypto.a> )
+		target_link_options ( digest_sha1 INTERFACE $<${ONLYGNUCLANGC_CXX}:-Wl,--exclude-libs,libssl.a,--exclude-libs,libcrypto.a> )
+	endif()
 	target_compile_options ( searchd_ssl PRIVATE "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-deprecated-declarations>" )
-	include ( CheckFunctionExists )
-	set ( CMAKE_REQUIRED_LIBRARIES "OpenSSL::SSL" )
-	check_function_exists ( TLS_server_method HAVE_TLS_SERVER_METHOD )
-	if (HAVE_TLS_SERVER_METHOD)
-		target_compile_definitions ( searchd_ssl PRIVATE HAVE_TLS_SERVER_METHOD=${HAVE_TLS_SERVER_METHOD} )
-	endif ()
-	check_function_exists ( TLSv1_2_method HAVE_TLSV1_2_METHOD )
-	if (HAVE_TLSV1_2_METHOD)
-		target_compile_definitions ( searchd_ssl PRIVATE HAVE_TLSV1_2_METHOD=${HAVE_TLSV1_2_METHOD} )
-	endif ()
-	check_function_exists ( TLSv1_1_server_method HAVE_TLSV1_1_SERVER_METHOD )
-	if (HAVE_TLSV1_1_SERVER_METHOD)
-		target_compile_definitions ( searchd_ssl PRIVATE HAVE_TLSV1_1_SERVER_METHOD=${HAVE_TLSV1_1_SERVER_METHOD} )
-	endif ()
 	if (WIN32 AND TARGET OpenSSL::applink)
 		target_link_libraries ( searchd_ssl PRIVATE OpenSSL::applink )
 		target_compile_options ( OpenSSL::applink INTERFACE $<${CLANGWIN}:-Wno-pedantic -Wno-missing-prototypes> )
@@ -317,21 +280,17 @@ if (WITH_SSL)
 endif (WITH_SSL)
 
 # support for replication
-add_library ( searchd_replication searchdreplication.cpp )
-target_link_libraries ( searchd_replication PUBLIC lextra )
-if (WITH_GALERA)
-	add_subdirectory ( replication )
-	target_link_libraries ( searchd_replication PRIVATE manticore::wsrep )
-	install_galera ( "${CMAKE_INSTALL_DATADIR}/manticore/modules" )
-endif ()
-target_link_libraries ( lsearchd PUBLIC searchd_replication )
+add_subdirectory ( replication )
+target_link_libraries ( lsearchd PUBLIC repli_stuff)
 
 trace ( lextra )
 trace ( lsearchd )
 
+add_subdirectory ( daemon )
+
 # our executables
 add_executable ( searchd searchd.cpp )
-target_link_libraries ( searchd searchd_ssl lmanticore lsearchd )
+target_link_libraries ( searchd daemon searchd_ssl lmanticore lsearchd )
 
 if (NOT STATIC_BINARY)
 	add_executable ( indexer indexer.cpp )
@@ -358,11 +317,13 @@ if (SPLIT_SYMBOLS)
 	split_dbg ( index_converter )
 endif ()
 
-INSTALL ( TARGETS searchd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT searchd )
+# These targets remain in their split components, but bundle builds stage the
+# same payload into the bundle component too via install_component_and_bundle().
+install_component_and_bundle ( searchd TARGETS searchd RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} )
 if (NOT STATIC_BINARY)
-	INSTALL ( TARGETS indexer indextool spelldump wordbreaker RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT tools )
-	INSTALL ( TARGETS index_converter RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT converter )
-	INSTALL ( FILES sphinxudf.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/manticore COMPONENT devel )
+	install_component_and_bundle ( tools TARGETS indexer indextool spelldump wordbreaker RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} )
+	install_component_and_bundle ( converter TARGETS index_converter RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} )
+	install_component_and_bundle ( devel FILES sphinxudf.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/manticore )
 endif ()
 
 # install windows runtime libraries - for final targets, and also for immediate testing
@@ -371,13 +332,14 @@ if (WIN32)
 	include ( InstallRequiredSystemLibraries )
 	addruntime ( "${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}" common )
 	getruntime ( libs common )
-	install ( PROGRAMS ${libs} DESTINATION bin COMPONENT common )
+	# Windows bundle archives need the same redistributables as the split packages.
+	install_component_and_bundle ( common PROGRAMS ${libs} DESTINATION bin )
 	unset ( libs )
 	getruntime ( libs daemon )
-	install ( PROGRAMS ${libs} DESTINATION bin COMPONENT searchd )
+	install_component_and_bundle ( searchd PROGRAMS ${libs} DESTINATION bin )
 	unset ( libs )
 	getruntime ( libs indexer )
-	install ( PROGRAMS ${libs} DESTINATION bin COMPONENT tools )
+	install_component_and_bundle ( tools PROGRAMS ${libs} DESTINATION bin )
 	if (BUILD_TESTING)
 #		getruntime ( libs indexer ) # is just set above
 		getruntime ( libs common )
@@ -403,7 +365,7 @@ if (CMAKE_VERSION VERSION_GREATER 3.1.0 AND NOT DISABLE_GTESTS AND NOT TEST_SPEC
 	add_subdirectory ( gtests )
 endif ()
 
-add_executable ( tests tests.cpp )
+add_executable ( tests EXCLUDE_FROM_ALL tests.cpp )
 target_link_libraries ( tests PUBLIC lmanticore )
 
 if (WITH_MYSQL)
@@ -415,7 +377,7 @@ if (WITH_MYSQL)
 	source_group ( "Testing config" FILES testrt.conf.in )
 	add_executable ( testrt testrt.cpp ${MANTICORE_BINARY_DIR}/config/rtestconfig.h )
 	target_compile_definitions ( testrt PRIVATE "DATAFLD=\"${DATAFLD}/\"" )
-	target_link_libraries ( testrt PRIVATE source_mysql PUBLIC lmanticore $<$<PLATFORM_ID:Windows>:psapi.lib> )
+	target_link_libraries ( testrt PRIVATE source_mysql PUBLIC lmanticore $<$<PLATFORM_ID:Windows>:psapi> )
 	if (HAVE_RTESTCONFIG_H)
 		target_compile_definitions ( testrt PRIVATE "-DHAVE_RTESTCONFIG_H" )
 	endif ()
@@ -480,8 +442,8 @@ if (NOT TEST_SPECIAL_EXTERNAL)
 		endif ()
 	endif ()
 
-	fixup_test_name ( tst "Internal src/tests" )
-	add_test ( NAME ${tst}
-			WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-			COMMAND "tests" )
+#	fixup_test_name ( tst "Internal src/tests" )
+#	add_test ( NAME ${tst} WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" COMMAND "tests" )
 endif ()
+
+add_subdirectory ( fuzzer )

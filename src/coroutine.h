@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -21,6 +21,12 @@
 // Once we do link - add searching of that component into Cmake, than m.b. remove this comment as redundant
 #include "coro_waker.h"
 
+#if defined( __clang__ ) || defined( __GNUC__ )
+#define ATTRIBUTE_NO_SANITIZE_ADDRESS __attribute__ ( ( no_sanitize_address ) )
+#else
+#define ATTRIBUTE_NO_SANITIZE_ADDRESS
+#endif
+
 #define LOG_LEVEL_RESEARCH true
 #define LOG_COMPONENT_OBJ this << " "
 #define LOG_COMPONENT_COROEV LOG_COMPONENT_OBJ << m_szName << ": "
@@ -34,8 +40,11 @@ const void* MyStack();
 /// get size of the stack (either thread, either coro - depends from context)
 int MyStackSize();
 
+/// whether I run in mocking context
+bool IsIMocked ();
+
 /// get size of used stack (threads or coro - depends from context)
-int64_t GetStackUsed();
+int64_t ATTRIBUTE_NO_SANITIZE_ADDRESS GetStackUsed ();
 
 // helper to align stack suze
 size_t AlignStackSize ( size_t iSize );
@@ -49,12 +58,15 @@ void CallCoroutine ( Handler fnHandler );
 bool CallCoroutineRes ( Predicate fnHandler );
 
 // start handler in coroutine, self (if any) or main scheduler, second-priority
-void StartJob ( Handler handler );
+void StartJob ( Handler handler, Scheduler_i * pScheduler = GlobalWorkPool() );
+
+// start handler in coroutine, with provided waiter used to detect when call is done.
+void StartCall ( Handler fnHandler, Waiter_t tWait, Scheduler_i* pScheduler = GlobalWorkPool() );
 
 // perform handler in custom stack
 // note: handler is called as linear routine, without scheduler.
 // It should NOT switch context (i.e. no yield/resume)
-void MockCallCoroutine ( VecTraits_T<BYTE> dStack, Handler fnHandler );
+ATTRIBUTE_NO_SANITIZE_ADDRESS void MockCallCoroutine ( VecTraits_T<BYTE> dStack, Handler fnHandler );
 
 // if returns true - we could perform runtime calculation of stack sizes.
 bool StackMockingAllowed();
@@ -190,12 +202,6 @@ private:
 	std::enable_if_t<ORD == ECONTEXT::ORDERED> ForAll ( FNPROCESSOR fnProcess, bool bIncludeRoot );
 };
 
-// create context and return resuming functor.
-// calling resumer will run handler until it finishes or yields.
-// returns flag of how coroutine interrupted: finished(true) or yielded(false)
-using Resumer_fn = std::function<bool()>;
-Resumer_fn MakeCoroExecutor ( Handler fnHandler );
-
 bool IsInsideCoroutine();
 
 namespace Coro
@@ -253,7 +259,8 @@ void SetDefaultThrottlingPeriodMS ( int tmPeriodMs );
 // -1 means 'use value of tmThrotleTimeQuantumMs'
 // 0 means 'don't throttle'
 // any other positive expresses throttling interval in milliseconds
-void SetThrottlingPeriod ( int tmPeriodMs = -1 );
+void SetThrottlingPeriodMS ( int tmPeriodMs = -1 );
+void SetThrottlingPeriodUS ( int64_t tmPeriodUs );
 int64_t GetThrottlingPeriodUS();
 
 // check if we run > ThrottleQuantum since last resume, or since timer restart
@@ -261,15 +268,15 @@ bool RuntimeExceeded() noexcept;
 const int64_t& GetNextTimePointUS() noexcept;
 
 // common throttle action - keep crash query and reschedule. Timer will be re-engaged on resume
-void RescheduleAndKeepCrashQuery();
+void RescheduleAndKeepCrashQuery ( bool bVip = false ) noexcept;
 
 // just re-engage timer, without rescheduling
 void RestartRuntime() noexcept;
 
-inline void ThrottleAndKeepCrashQuery()
+inline void ThrottleAndKeepCrashQuery ( bool bVip = false ) noexcept
 {
 	if ( RuntimeExceeded() )
-		RescheduleAndKeepCrashQuery();
+		RescheduleAndKeepCrashQuery ( bVip );
 }
 
 // yield and reschedule after given period of time (in milliseconds)
@@ -317,7 +324,7 @@ public:
 // instead of real blocking it yield current coro, so, MUST be used only with coro context
 class CAPABILITY ( "mutex" ) RWLock_c: public ISphNoncopyable
 {
-	sph::Spinlock_c m_tInternalMutex {};
+	mutable sph::Spinlock_c m_tInternalMutex {};
 	WaitQueue_c m_tWaitRQueue {};
 	WaitQueue_c m_tWaitWQueue {};
 	DWORD m_uState { 0 }; // lower bit - w-locked, rest - N of r-locks with bias 2
@@ -327,6 +334,37 @@ public:
 	void WriteLock() ACQUIRE();
 	void ReadLock() ACQUIRE_SHARED();
 	void Unlock() UNLOCK_FUNCTION();
+	bool TestNextWlock() const noexcept;
+};
+
+class ReadTableLock_c final
+{
+	mutable sph::Spinlock_c m_tInternalMutex {};
+	WaitQueue_c m_tWaitRQueue {};
+	DWORD m_uReads = 0;
+	DWORD m_uWrites = 0;
+
+public:
+	NONCOPYMOVABLE ( ReadTableLock_c );
+	ReadTableLock_c() = default;
+	~ReadTableLock_c() = default;
+	bool TryWrite() noexcept;
+	void WaitRead() noexcept;
+	void FinishWrite() noexcept;
+	[[nodiscard]] bool UnlockRead() noexcept;
+	[[nodiscard]] DWORD GetReads() const noexcept;
+};
+
+class ScopedWriteTable_c final
+{
+	ReadTableLock_c& m_tTableLock;
+	bool m_bCanWrite;
+
+public:
+	NONCOPYMOVABLE ( ScopedWriteTable_c );
+	explicit ScopedWriteTable_c ( ReadTableLock_c& tTableLock );
+	~ScopedWriteTable_c();
+	[[nodiscard]] bool CanWrite() const noexcept;
 };
 
 class CAPABILITY ( "mutex" ) Mutex_c: public ISphNoncopyable

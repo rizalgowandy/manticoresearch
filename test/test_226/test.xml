@@ -85,6 +85,93 @@ index fs1
 	path              = <data_path/>/fs1
 }
 
+source src_11
+{
+	type              = mysql
+	<sql_settings/>
+	sql_query         = SELECT id, price, categories FROM test_table where id in (1,2,3,4)
+	sql_attr_uint     = price
+	sql_attr_multi    = uint categories from field
+}
+
+source src_12
+{
+	type              = mysql
+	<sql_settings/>
+	sql_query         = SELECT id, price, categories FROM test_table where id in (6,7,8,9)
+	sql_attr_uint     = price
+	sql_attr_multi    = uint categories from field
+}
+
+index loc11
+{
+	source            = src_11
+	path              = <data_path/>/loc11
+}
+
+index loc12
+{
+	source            = src_12
+	path              = <data_path/>/loc12
+}
+
+index dist11
+{
+	type              = distributed
+	local             = loc11
+    local             = loc12
+}
+
+index dist12
+{
+	type              = distributed
+	local             = loc11
+    agent             = <my_address/>:loc12
+}
+
+source src_multi1
+{
+	type              = mysql
+	<sql_settings/>
+	sql_query         = SELECT * FROM table_multi1
+	sql_attr_uint   = brand_id
+	sql_attr_json     = j
+}
+
+
+index multi1
+{
+	source            = src_multi1
+	path              = <data_path/>/multi1
+}
+
+index dist_fs1
+{
+	type              = distributed
+	agent             = <my_address/>:fs1
+}
+
+source src_fs2
+{
+	type              = mysql
+	<sql_settings/>
+	sql_query         = SELECT * FROM table_fs2
+	sql_attr_json     = j
+}
+
+index fs2
+{
+	source            = src_fs2
+	path              = <data_path/>/fs2
+}
+
+index fs_arr1
+{
+	type              = rt
+	path              = <data_path/>/fs_arr1
+	rt_field          = title
+	rt_attr_json      = j
+}
 
 </config>
 
@@ -145,6 +232,41 @@ insert into table_fs1 (id,title,s_color,j) values
 (3,'Product 3', 'green', '{x:[33,34],color:"green"}'),
 (4,'Product 4', 'red', '{x:[43,44],color:"red"}'),
 (5,'Product 5', 'blue', '{x:[53,54],color:"blue"}')
+</db_insert>
+
+<db_create>
+CREATE TABLE `table_multi1` (
+  `id` int(11),
+  `title` varchar(255),
+  `brand_id` int(11),
+  `j` varchar(255)
+);
+</db_create>
+<db_drop>DROP TABLE IF EXISTS `table_multi1`;</db_drop>
+
+<db_insert>
+insert into table_multi1 (id,title,brand_id,j) values
+(1,'Product 1', 11, '{a:13, b:14}'),
+(2,'Product 2', 12, '{a:13, b:12}'),
+(3,'Product 3', 13, '{a:11, b:13}')
+</db_insert>
+
+<db_create>
+CREATE TABLE `table_fs2` (
+  `id` int(11),
+  `title` varchar(255),
+  `j` varchar(255)
+);
+</db_create>
+
+<db_drop>DROP TABLE IF EXISTS `table_fs2`;</db_drop>
+
+<db_insert>
+insert into table_fs2 (id,title,j) values
+(1,'Product 1', '{"key": [1,2,3]}'),
+(2,'Product 2', '{"key": [2,3,4]}'),
+(3,'Product 3', '{"key": [4,5,2147483647]}'),
+(4,'Product 4', '{"key": [4,5,2147483648]}')
 </db_insert>
 
 <queries><sphinxql>
@@ -249,6 +371,43 @@ select id, j, s_color from fs1 facet s_color order by j.color desc;;
 
 <!-- group by JSON.field with string at select list vs multi-query -->
 select id, GROUPBY() as groupbystr, count(*) as c FROM facetdemo2 GROUP BY j['x'][0] ORDER BY groupbystr ASC; select id, GROUPBY() as groupbystr, count(*) as c FROM facetdemo2 GROUP BY j['a'][0] ORDER BY groupbystr ASC;
+
+<!-- facet MVA wrong from distributed with agents and local -->
+select * from dist11 facet categories order by FACET() asc;;
+select * from dist12 facet categories order by FACET() asc;;
+
+<!-- facet vs group by with multi grouper with JSON.field  -->
+select *, count(*) from multi1 facet brand_id, j.a order by id asc;;
+select *, count(*), brand_id, j.a from multi1 facet brand_id, j.a order by id asc;;
+select *, count(*) from multi1 group by brand_id, j.a order by id asc;;
+select *, count(*), brand_id, j.a from multi1 group by brand_id, j.a order by id asc;;
+
+<!-- facet with default desc order -->
+select id from facetdemo limit 0 facet brand_id order by count(*);;
+<!-- facet with error at the FACET part -->
+select id from facetdemo limit 0 facet brand_id order by count(missed);;
+
+<!-- facet with sort on json.field -->
+select * from multi1 order by bigint(j.b) asc facet id limit 0;;
+select * from multi1 order by j.b asc facet id limit 0;;
+select * from multi1 order by j.b asc;;
+select * from multi1 order by bigint(j.b) asc;;
+select *, bigint(j.b) as c from multi1 order by c asc facet id limit 0;;
+select *, j.b as c from multi1 order by c asc facet id limit 0;;
+
+<!-- facet with json.field vs alias -->
+select id, j from fs1 where id &lt; 3 facet j.x order by FACET() asc facet j.x as x_val order by FACET() asc;;
+select id, j from dist_fs1 where id &lt; 3 facet j.x order by FACET() asc facet j.x as x_val order by FACET() asc;;
+select id, j from fs1 where id &lt; 3 facet j['x'] as x_val order by FACET() asc;;
+
+select id, j from fs2 facet j.key order by FACET() asc;;
+select id, j from fs2 facet j.key as k order by FACET() asc;;
+
+<!-- facet with json.array items -->
+insert into fs_arr1(id, j) values(1, '["S","M"]'),(2, '["M","L"]'),(3, '{"a": 1}'),(4, '{"a": 2}'),(5, '[1,2]'),(6, '[{"a":123}, {"b": 123}]');
+select groupby() as g, count(*) from fs_arr1 group by j;;
+select id from fs_arr1 limit 0 facet j order by FACET() asc;;
+
 </sphinxql></queries>
 
 </test>

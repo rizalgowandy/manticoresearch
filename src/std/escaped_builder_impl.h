@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -46,17 +46,26 @@ bool EscapedStringBuilder_T<Q>::AppendEmptyEscaped ( const char* sText )
 
 // dedicated EscBld::eEscape | EscBld::eSkipComma
 template<typename Q>
-void EscapedStringBuilder_T<Q>::AppendEscapedSkippingComma ( const char* sText )
+template<bool BQUOTE>
+void EscapedStringBuilder_T<Q>::AppendEscapedSkippingCommaT ( const char* sText )
 {
-	if ( AppendEmptyEscaped ( sText ) )
-		return;
+	if constexpr ( BQUOTE )
+	{
+		if ( AppendEmptyEscaped ( sText ) )
+			return;
+	} else
+	{
+		if ( !sText || !*sText )
+			return;
+	}
 
-	GrowEnough ( 7 ); // 2 quotes, terminator, and possible 4 for long escaping
+	GrowEnough ( BQUOTE ? 7 : 5 ); // 2 quotes, terminator, and possible 4 for long escaping
 	const char* pSrc = sText;
 	auto* pCur = (BYTE*)end();
 	auto pEnd = (BYTE*)m_szBuffer + m_iSize;
 
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	for ( ; *pSrc; ++pSrc )
 	{
 		Q::EscapeChar ( pCur, *pSrc );
@@ -69,14 +78,27 @@ void EscapedStringBuilder_T<Q>::AppendEscapedSkippingComma ( const char* sText )
 			pCur = (BYTE*)m_szBuffer + m_iUsed;
 		}
 	}
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	*pCur = '\0';
 	m_iUsed = pCur - (BYTE*)m_szBuffer;
 }
 
-// dedicated EscBld::eEscape with comma
 template<typename Q>
-void EscapedStringBuilder_T<Q>::AppendEscapedWithComma ( const char* sText )
+void EscapedStringBuilder_T<Q>::AppendEscapedSkippingComma ( const char* sText )
+{
+	AppendEscapedSkippingCommaT ( sText );
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::AppendEscapedSkippingCommaNoQuotes ( const char* sText )
+{
+	AppendEscapedSkippingCommaT<false> ( sText );
+}
+
+template<typename Q>
+template<bool BQUOTE>
+void EscapedStringBuilder_T<Q>::AppendEscapedWithCommaT ( const char* sText )
 {
 	auto& sComma = Delim();
 	if ( sComma.second )
@@ -86,15 +108,23 @@ void EscapedStringBuilder_T<Q>::AppendEscapedWithComma ( const char* sText )
 		m_iUsed += sComma.second;
 	}
 
-	if ( AppendEmptyEscaped ( sText ) )
-		return;
+	if constexpr ( BQUOTE )
+	{
+		if ( AppendEmptyEscaped ( sText ) )
+			return;
+	} else
+	{
+		if ( !sText || !*sText )
+			return;
+	}
 
-	GrowEnough ( 7 ); // 2 quotes and terminator
+	GrowEnough ( BQUOTE ? 7 : 5 ); // 2 quotes and terminator
 	const char* pSrc = sText;
 	auto* pCur = (BYTE*)end();
 	auto pEnd = (BYTE*)m_szBuffer + m_iSize;
 
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	for ( ; *pSrc; ++pSrc )
 	{
 		Q::EscapeChar ( pCur, *pSrc );
@@ -107,14 +137,28 @@ void EscapedStringBuilder_T<Q>::AppendEscapedWithComma ( const char* sText )
 			pCur = (BYTE*)m_szBuffer + m_iUsed;
 		}
 	}
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	*pCur = '\0';
 	m_iUsed = pCur - (BYTE*)m_szBuffer;
 }
 
+template<typename Q>
+void EscapedStringBuilder_T<Q>::AppendEscapedWithComma ( const char* sText )
+{
+	AppendEscapedWithCommaT ( sText );
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::AppendEscapedWithCommaNoQuotes ( const char* sText )
+{
+	AppendEscapedWithCommaT<false> ( sText );
+}
+
 // dedicated EscBld::eEscape with comma with external len
 template<typename Q>
-void EscapedStringBuilder_T<Q>::AppendEscapedWithComma ( const char* sText, int iLen )
+template<bool BQUOTE>
+void EscapedStringBuilder_T<Q>::AppendEscapedWithCommaT ( const char* sText, int iLen )
 {
 	auto& sComma = Delim();
 	if ( sComma.second )
@@ -125,14 +169,19 @@ void EscapedStringBuilder_T<Q>::AppendEscapedWithComma ( const char* sText, int 
 	}
 
 	if ( !iLen )
-		return AppendEmptyQuotes();
+	{
+		if constexpr ( BQUOTE )
+			return AppendEmptyQuotes();
+		return;
+	}
 
-	GrowEnough ( 7 ); // 2 quotes, terminator, and possible 4 for long escaping
+	GrowEnough ( BQUOTE ? 7 : 5 ); // 2 quotes, terminator, and possible 4 for long escaping
 	const char* pSrc = sText;
 	auto* pCur = (BYTE*)end();
 	auto pEnd = (BYTE*)m_szBuffer + m_iSize;
 
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	for ( ; iLen; ++pSrc, --iLen )
 	{
 		Q::EscapeChar ( pCur, *pSrc );
@@ -145,9 +194,71 @@ void EscapedStringBuilder_T<Q>::AppendEscapedWithComma ( const char* sText, int 
 			pCur = (BYTE*)m_szBuffer + m_iUsed;
 		}
 	}
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	*pCur = '\0';
 	m_iUsed = pCur - (BYTE*)m_szBuffer;
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::AppendEscapedWithComma ( const char* sText, int iLength )
+{
+	AppendEscapedWithCommaT ( sText, iLength );
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::AppendEscapedWithCommaNoQuotes ( const char* sText, int iLength )
+{
+	AppendEscapedWithCommaT<false> ( sText, iLength );
+}
+
+// dedicated EscBld::eEscape with comma with external len
+template<typename Q>
+template<bool BQUOTE>
+void EscapedStringBuilder_T<Q>::AppendEscapedSkippingCommaT ( const char* sText, int iLen )
+{
+	if ( !iLen )
+	{
+		if constexpr ( BQUOTE )
+			return AppendEmptyQuotes();
+		return;
+	}
+
+	GrowEnough ( BQUOTE ? 7 : 5 ); // 2 quotes, terminator, and possible 4 for long escaping
+	const char* pSrc = sText;
+	auto* pCur = (BYTE*)end();
+	auto pEnd = (BYTE*)m_szBuffer + m_iSize;
+
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
+	for ( ; iLen; ++pSrc, --iLen )
+	{
+		Q::EscapeChar ( pCur, *pSrc );
+
+		if ( pCur > ( pEnd - 8 ) ) // need 1 ending quote, terminator, and m.b. long escaping
+		{
+			m_iUsed = pCur - (BYTE*)m_szBuffer;
+			GrowEnough ( 32 );
+			pEnd = (BYTE*)m_szBuffer + m_iSize;
+			pCur = (BYTE*)m_szBuffer + m_iUsed;
+		}
+	}
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
+	*pCur = '\0';
+	m_iUsed = pCur - (BYTE*)m_szBuffer;
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::AppendEscapedSkippingComma ( const char* sText, int iLength )
+{
+	AppendEscapedSkippingCommaT ( sText, iLength );
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::AppendEscapedSkippingCommaNoQuotes ( const char* sText, int iLength )
+{
+	AppendEscapedSkippingCommaT<false> ( sText, iLength );
 }
 
 // dedicated EscBld::eFixupSpace
@@ -188,7 +299,8 @@ void EscapedStringBuilder_T<Q>::FixupSpacesAndAppend ( const char* sText )
 
 // dedicated EscBld::eAll (=EscBld::eFixupSpace | EscBld::eEscape )
 template<typename Q>
-void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscaped ( const char* sText )
+template<bool BQUOTE>
+void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscapedT ( const char* sText )
 {
 	auto& sComma = Delim();
 	if ( sComma.second )
@@ -198,15 +310,23 @@ void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscaped ( const char* sText 
 		m_iUsed += sComma.second;
 	}
 
-	if ( AppendEmptyEscaped ( sText ) )
-		return;
+	if constexpr ( BQUOTE )
+	{
+		if ( AppendEmptyEscaped ( sText ) )
+			return;
+	} else
+	{
+		if ( !sText || !*sText )
+			return;
+	}
 
-	GrowEnough ( 7 ); // 2 quotes, terminator, and possible 4 for long escaping
+	GrowEnough ( BQUOTE ? 7 : 5 ); // 2 quotes, terminator, and possible 4 for long escaping
 	const char* pSrc = sText;
 	auto* pCur = (BYTE*)end();
 	auto pEnd = (BYTE*)m_szBuffer + m_iSize;
 
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	for ( ; *pSrc; ++pSrc )
 	{
 		Q::EscapeCharWithSpaces ( pCur, *pSrc );
@@ -219,14 +339,28 @@ void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscaped ( const char* sText 
 			pCur = (BYTE*)m_szBuffer + m_iUsed;
 		}
 	}
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	*pCur = '\0';
 	m_iUsed = pCur - (BYTE*)m_szBuffer;
 }
 
+template<typename Q>
+void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscaped ( const char* sText )
+{
+	FixupSpacedAndAppendEscapedT ( sText );
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscapedNoQuotes ( const char* sText )
+{
+	FixupSpacedAndAppendEscapedT<false> ( sText );
+}
+
 // dedicated EscBld::eAll (=EscBld::eFixupSpace | EscBld::eEscape ) with external len
 template<typename Q>
-void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscaped ( const char* sText, int iLen )
+template<bool BQUOTE>
+void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscapedT ( const char* sText, int iLen )
 {
 	assert ( iLen >= 0 );
 
@@ -239,14 +373,19 @@ void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscaped ( const char* sText,
 	}
 
 	if ( !iLen )
-		return AppendEmptyQuotes();
+	{
+		if constexpr ( BQUOTE )
+			return AppendEmptyQuotes();
+		return;
+	}
 
-	GrowEnough ( 7 ); // 2 quotes, terminator, and possible 4 for long escaping
+	GrowEnough ( BQUOTE ? 7 : 5 ); // 2 quotes, terminator, and possible 4 for long escaping
 	const char* pSrc = sText;
 	auto* pCur = (BYTE*)end();
 	auto pEnd = (BYTE*)m_szBuffer + m_iSize;
 
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	for ( ; iLen; ++pSrc, --iLen )
 	{
 		Q::EscapeCharWithSpaces ( pCur, *pSrc );
@@ -258,9 +397,22 @@ void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscaped ( const char* sText,
 			pCur = (BYTE*)m_szBuffer + m_iUsed;
 		}
 	}
-	*pCur++ = Q::cQuote;
+	if constexpr ( BQUOTE )
+		*pCur++ = Q::cQuote;
 	*pCur = '\0';
 	m_iUsed = pCur - (BYTE*)m_szBuffer;
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscaped ( const char* sText, int iLen )
+{
+	FixupSpacedAndAppendEscapedT ( sText, iLen );
+}
+
+template<typename Q>
+void EscapedStringBuilder_T<Q>::FixupSpacedAndAppendEscapedNoQuotes ( const char* sText, int iLen )
+{
+	FixupSpacedAndAppendEscapedT<false> ( sText, iLen );
 }
 
 // generic implementation. Used this way in tests. For best performance consider to use specialized versions
@@ -279,20 +431,42 @@ void EscapedStringBuilder_T<Q>::AppendEscaped ( const char* sText, BYTE eWhat, i
 	case ( EscBld::eEscape | EscBld::eSkipComma | EscBld::eNoLimit ):
 		AppendEscapedSkippingComma ( sText );
 		return;
+	case ( EscBld::eEscape | EscBld::eSkipComma | EscBld::eNoLimit | EscBld::eSkipQuotes ):
+		AppendEscapedSkippingCommaNoQuotes ( sText );
+		return;
+	case ( EscBld::eEscape | EscBld::eSkipComma ):
+		AppendEscapedSkippingComma ( sText, iLen );
+		return;
+	case ( EscBld::eEscape | EscBld::eSkipComma | EscBld::eSkipQuotes ):
+		AppendEscapedSkippingCommaNoQuotes ( sText, iLen );
+		return;
 	case ( EscBld::eEscape | EscBld::eNoLimit ):
 		AppendEscapedWithComma ( sText );
+		return;
+	case ( EscBld::eEscape | EscBld::eNoLimit | EscBld::eSkipQuotes ):
+		AppendEscapedWithCommaNoQuotes ( sText );
 		return;
 	case ( EscBld::eEscape ):
 		AppendEscapedWithComma ( sText, iLen );
 		return;
+	case ( EscBld::eEscape | EscBld::eSkipQuotes ):
+		AppendEscapedWithCommaNoQuotes ( sText, iLen );
+		return;
 	case ( EscBld::eFixupSpace | EscBld::eNoLimit ):
+	case ( EscBld::eFixupSpace | EscBld::eNoLimit | EscBld::eSkipQuotes ):
 		FixupSpacesAndAppend ( sText );
 		return;
 	case ( EscBld::eAll | EscBld::eNoLimit ):
 		FixupSpacedAndAppendEscaped ( sText );
 		return;
+	case ( EscBld::eAll | EscBld::eNoLimit | EscBld::eSkipQuotes ):
+		FixupSpacedAndAppendEscapedNoQuotes ( sText );
+		return;
 	case ( EscBld::eAll ):
 		FixupSpacedAndAppendEscaped ( sText, iLen );
+		return;
+	case ( EscBld::eAll | EscBld::eSkipQuotes ):
+		FixupSpacedAndAppendEscapedNoQuotes ( sText, iLen );
 		return;
 	}
 
@@ -331,7 +505,9 @@ void EscapedStringBuilder_T<Q>::AppendEscaped ( const char* sText, BYTE eWhat, i
 				iFinalLen += Q::EscapingSpace ( *pSrc );
 		}
 		iLen = (int)( pSrc - sText );
-		iFinalLen += iLen + 2; // 2 quotes: 1 prefix, 2 postfix.
+		iFinalLen += iLen;
+		if ( 0==(eWhat & EscBld::eSkipQuotes) )
+			iFinalLen += 2; // 2 quotes: 1 prefix, 2 postfix.
 	} else if ( eWhat & EscBld::eNoLimit )
 	{
 		eWhat &= ~EscBld::eNoLimit;
@@ -357,6 +533,10 @@ void EscapedStringBuilder_T<Q>::AppendEscaped ( const char* sText, BYTE eWhat, i
 		for ( ; iLen; --iLen )
 			Q::EscapeChar ( pCur, *sText++ );
 		*pCur++ = Q::cQuote;
+		break;
+	case EscBld::eEscape | EscBld::eSkipQuotes:
+		for ( ; iLen; --iLen )
+			Q::EscapeChar ( pCur, *sText++ );
 		break;
 	case EscBld::eAll:
 	default:

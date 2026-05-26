@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -24,7 +24,7 @@ protected:
 	~TemplateDictTraits_c() override;
 
 public:
-	void LoadStopwords ( const char* sFiles, const TokenizerRefPtr_c& pTokenizer, bool bStripFile ) final;
+	void LoadStopwords ( const char * sFiles, FilenameBuilder_i * pFilenameBuilder, const TokenizerRefPtr_c & pTokenizer, bool bStripFile ) final;
 	void LoadStopwords ( const CSphVector<SphWordID_t>& dStopwords ) final;
 	void WriteStopwords ( Writer_i & tWriter ) const final;
 	void WriteStopwords ( JsonEscapedBuilder& tOut ) const final;
@@ -70,5 +70,6 @@ private:
 	int InitMorph ( const char* szMorph, int iLength, CSphString& sError );
 	int AddMorph ( int iMorph ); ///< helper that always returns ST_OK
 	bool StemById ( BYTE* pWord, int iStemmer ) const;
-	void AddWordform ( CSphWordforms* pContainer, char* sBuffer, int iLen, const TokenizerRefPtr_c& pTokenizer, const char* szFile, const CSphVector<int>& dBlended, int iFileId );
+	void AddWordform ( CSphWordforms* pContainer, char* sBuffer, int iLen, const TokenizerRefPtr_c& pTokenizer, const char* szFile, const CSphVector<int>& dBlended, int iFileId, StrVec_t & dDst2Norm );
+	static void AddDst2Norm ( CSphWordforms* pContainer, StrVec_t & dDst2Norm );
 };

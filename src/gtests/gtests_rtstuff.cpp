@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -19,6 +19,8 @@
 #include "searchdaemon.h"
 #include "binlog.h"
 #include "accumulator.h"
+#include "sphinxudf.h"
+#include "sphinxquery/xqparser.h"
 
 #include <gmock/gmock.h>
 
@@ -44,8 +46,8 @@ void TestRTInit ()
 {
 	CSphConfigSection tRTConfig;
 
-	sphRTInit ( tRTConfig, true, nullptr );
-	Binlog::Configure ( tRTConfig, true, 0 );
+	sphRTInit ( "" );
+	Binlog::Configure ( tRTConfig, 0 );
 
 	SmallStringHash_T<CSphIndex *> hIndexes;
 	Binlog::Replay ( hIndexes );
@@ -294,7 +296,7 @@ TEST_F ( RT, WeightBoundary )
 	StrVec_t dWarnings;
 	EXPECT_TRUE ( pIndex->Prealloc ( false, nullptr, dWarnings ) );
 
-	InsertDocData_t tDoc ( pIndex->GetMatchSchema() );
+	InsertDocData_c tDoc ( pIndex->GetMatchSchema() );
 	int iDynamic = pIndex->GetMatchSchema().GetRowSize();
 
 	RtAccum_t tAcc;
@@ -402,7 +404,7 @@ TEST_F ( RT, RankerFactors )
 	Verify ( pIndex->Prealloc ( false, nullptr, dWarnings ) );
 
 	CSphString sFilter;
-	InsertDocData_t tDoc ( pIndex->GetMatchSchema() );
+	InsertDocData_c tDoc ( pIndex->GetMatchSchema() );
 	int iDynamic = pIndex->GetMatchSchema().GetRowSize();
 
 	RtAccum_t tAcc;
@@ -608,7 +610,7 @@ TEST_F ( RT, SendVsMerge )
 	ASSERT_TRUE ( pSorter );
 
 	CSphString sFilter;
-	InsertDocData_t tDoc ( pIndex->GetMatchSchema() );
+	InsertDocData_c tDoc ( pIndex->GetMatchSchema() );
 	int iDynamic = pIndex->GetMatchSchema().GetRowSize();
 
 	RtAccum_t tAcc;

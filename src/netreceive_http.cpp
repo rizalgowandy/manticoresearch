@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -14,11 +14,114 @@
 #include "searchdssl.h"
 #include "searchdhttp.h"
 #include "tracer.h"
+#include "daemon/logger.h"
 
 extern int g_iClientTimeoutS; // from searchd.cpp
 extern volatile bool g_bMaintenance;
 
+int GetGlobalReqID () noexcept
+{
+	static std::atomic<int> iReqID { 1 };
+	return iReqID.fetch_add ( 1, std::memory_order_relaxed );
+}
 
+
+class LoggingAsyncNetBuffer_c final : public AsyncNetBuffer_c
+{
+	std::unique_ptr<AsyncNetBuffer_c> m_pFrontend;
+	AsyncNetInputBuffer_c & m_tIn;
+	GenericOutputBuffer_c & m_tOut;
+	int m_iReqID;
+	int64_t m_iIncomingTimestamp;
+	CSphTightVector<BYTE> m_dInput;
+
+protected:
+	int ReadFromBackend ( int iNeed, int iSpace, bool bIntr ) final
+	{
+		int iRead = 0;
+		while ( iNeed>iRead )
+		{
+			// read raw packet
+			if ( !m_tIn.ReadFrom ( iNeed, bIntr ) )
+				return -1;
+
+			iNeed =  Clamp ( iNeed, iSpace, m_tIn.HasBytes () );
+
+			auto dChunk = AllocateBuffer ( iNeed );
+			m_tIn.GetBytes ( dChunk.begin (), iNeed );
+			iRead += iNeed;
+			m_dInput.Append ( dChunk.begin(), iNeed );
+			if ( !m_iIncomingTimestamp )
+				m_iIncomingTimestamp = sphMicroTimer ();
+		}
+		return iRead;
+	}
+
+public:
+	explicit LoggingAsyncNetBuffer_c ( std::unique_ptr<AsyncNetBuffer_c>&& pFrontend )
+			: m_pFrontend ( std::move ( pFrontend ) )
+			, m_tIn ( *m_pFrontend )
+			, m_tOut ( *m_pFrontend )
+			, m_iReqID ( 0 )
+			, m_iIncomingTimestamp ( 0 )
+	{}
+
+	void SetWTimeoutUS ( int64_t iTimeoutUS ) final
+	{
+		m_tOut.SetWTimeoutUS ( iTimeoutUS );
+	};
+
+	int64_t GetWTimeoutUS () const final
+	{
+		return m_tOut.GetWTimeoutUS ();
+	}
+
+	void SetTimeoutUS ( int64_t iTimeoutUS ) final
+	{
+		m_tIn.SetTimeoutUS ( iTimeoutUS );
+	};
+
+	int64_t GetTimeoutUS () const final
+	{
+		return m_tIn.GetTimeoutUS ();
+	}
+
+	int64_t GetTotalReceived () const final
+	{
+		return m_tIn.GetTotalReceived ();
+	}
+
+	int64_t GetTotalSent () const final
+	{
+		return m_tOut.GetTotalSent ();
+	}
+
+	void SetReqID ( int iID ) noexcept
+	{
+		m_iReqID = iID;
+	}
+
+	bool SendBuffer ( const VecTraits_T<BYTE> & dData ) final
+	{
+		logHttpInput ( m_dInput, m_iReqID, std::exchange ( m_iIncomingTimestamp, 0 ) );
+		m_dInput.Reset();
+		logHttpOutput ( dData, m_iReqID );
+		m_tOut.SendBytes ( dData );
+		return m_tOut.Flush();
+	}
+};
+
+bool MakeLoggingLayer ( std::unique_ptr<AsyncNetBuffer_c> & pSource )
+{
+	pSource = std::make_unique<LoggingAsyncNetBuffer_c> ( std::move ( pSource ) );
+	return true;
+}
+
+bool SendReply ( GenericOutputBuffer_c & tOut, CSphVector<BYTE>& dData ) noexcept
+{
+	tOut.SwapData ( dData );
+	return tOut.Flush ();
+};
 
 void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 {
@@ -47,7 +150,7 @@ void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 	if ( bINeedSSL && !bHeNeedSSL )
 	{
 		CSphVector<BYTE> dResult;
-		sphHttpErrorReply ( dResult, SPH_HTTP_STATUS_400, "The plain HTTP request was sent to HTTPS port" );
+		sphHttpErrorReply ( dResult, EHTTP_STATUS::_400, "The plain HTTP request was sent to HTTPS port" );
 		auto & tOut = *(GenericOutputBuffer_c *) pBuf.get();
 		tOut.SwapData ( dResult );
 		tOut.Flush (); // no need to check return code since we break anyway
@@ -64,6 +167,10 @@ void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 	if ( bHeNeedSSL )
 		tSess.SetSsl ( MakeSecureLayer ( pBuf ) );
 
+	bool bHttpLogging = HttpLogEnabled();
+	if ( bHttpLogging )
+		MakeLoggingLayer ( pBuf );
+
 	auto& tOut = *(GenericOutputBuffer_c *) pBuf.get();
 	auto& tIn = *(AsyncNetInputBuffer_c *) pBuf.get();
 
@@ -73,18 +180,18 @@ void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 	CSphVector<BYTE> dResult;
 	TRACE_CONN ( "conn", "HttpServe" );
 
-	auto HttpReply = [&dResult, &tOut] ( ESphHttpStatus eCode, Str_t sMsg )
+	auto HttpReply = [&dResult, &tOut] ( EHTTP_STATUS eCode, Str_t sMsg )
 	{
 		if ( IsEmpty ( sMsg ) )
 		{
-			HttpBuildReply ( dResult, eCode, sMsg, false );
+			HttpReplyTrait_t tReply { eCode, sMsg };
+			HttpBuildReply ( tReply, dResult );
 		} else
 		{
 			LogNetError ( sMsg.first );
 			sphHttpErrorReply ( dResult, eCode, sMsg.first );
 		}
-		tOut.SwapData ( dResult );
-		return tOut.Flush();
+		return SendReply ( tOut, dResult );
 	};
 
 	do
@@ -92,7 +199,15 @@ void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 		tIn.DiscardProcessed ( -1 ); // -1 means 'force flush'
 		tParser.Reinit();
 
+		tIn.SetTimeoutUS ( S2US * (tSess.GetPersistent()?g_iClientTimeoutS:g_iReadTimeoutS) );
+
 		tSess.SetKilled ( false );
+
+		if ( bHttpLogging )
+		{
+			auto pLoggingBuf = static_cast<LoggingAsyncNetBuffer_c *> (pBuf.get ());
+			pLoggingBuf->SetReqID ( GetGlobalReqID() );
+		}
 
 		// read HTTP header
 		while ( !tParser.ParseHeader ( tIn.Tail() ) )
@@ -105,7 +220,7 @@ void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 			if ( !iChunk || tIn.GetError() )
 			{
 				sError.SetSprintf ( "failed to receive HTTP request, %s", ( tIn.GetError() ? tIn.GetErrorMessage().cstr() : sphSockError() ) );
-				HttpReply ( SPH_HTTP_STATUS_400, FromStr ( sError ) );
+				HttpReply ( EHTTP_STATUS::_400, FromStr ( sError ) );
 			}
 
 			return;
@@ -118,14 +233,17 @@ void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 				sError.SetSprintf ( "%s, %s", tIn.GetErrorMessage().cstr(), tParser.Error() );
 			else
 				sError = tParser.Error();
-			HttpReply ( SPH_HTTP_STATUS_400, FromStr ( sError ) );
+			HttpReply ( EHTTP_STATUS::_400, FromStr ( sError ) );
 			break;
 		}
 
+		session::Info().SetBuddy ( tParser.IsBuddyQuery() );
+
 		// check if we should interrupt because of maxed-out
+		// but not for buddy queries
 		if ( IsMaxedOut() )
 		{
-			HttpReply ( SPH_HTTP_STATUS_503, g_sMaxedOutMessage );
+			HttpReply ( EHTTP_STATUS::_503, g_sMaxedOutMessage );
 			gStats().m_iMaxedOut.fetch_add ( 1, std::memory_order_relaxed );
 			break;
 		}
@@ -134,18 +252,22 @@ void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 		if ( tParser.KeepAlive() )
 		{
 			if ( !tSess.GetPersistent() )
+			{
+				tSess.SetPersistent ( true );
 				tIn.SetTimeoutUS ( S2US * g_iClientTimeoutS );
-			tSess.SetPersistent ( true );
+			}
 		} else {
 			if ( tSess.GetPersistent() )
+			{
+				tSess.SetPersistent ( false );
 				tIn.SetTimeoutUS ( S2US * g_iReadTimeoutS );
-			tSess.SetPersistent ( false );
+			}
 		}
 
 		// if first chunk is (most probably) pure header, we can proceed special headers here
 		if ( tParser.Expect100() && !tParser.ParsedBodyLength() )
 		{
-			if ( !HttpReply ( SPH_HTTP_STATUS_100, dEmptyStr ) )
+			if ( !HttpReply ( EHTTP_STATUS::_100, dEmptyStr ) )
 				break;
 			LogReplyStatus100();
 		}
@@ -153,8 +275,7 @@ void HttpServe ( std::unique_ptr<AsyncNetBuffer_c> pBuf )
 //		tracer.Instant ( [&tIn](StringBuilder_c& sOut) {sOut<< ",\"args\":{\"step\":"<<tIn.HasBytes()<<"}";} );
 		bOk = tParser.ProcessClientHttp ( tIn, dResult );
 
-		tOut.SwapData (dResult);
-		if ( !tOut.Flush () )
+		if ( !SendReply ( tOut, dResult ) )
 			break;
 
 		pBuf->SyncErrorState();

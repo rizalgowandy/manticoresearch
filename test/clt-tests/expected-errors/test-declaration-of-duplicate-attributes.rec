@@ -1,0 +1,11 @@
+––– input –––
+echo '<?xml version="1.0" encoding="utf-8"?><sphinx:docset xmlns:sphinx="http://sphinxsearch.com/"><sphinx:schema><sphinx:attr name="a" type="int" /><sphinx:attr name="a" type="string" /></sphinx:schema><sphinx:document id="10"><a>1</a><a>a</a></sphinx:document></sphinx:docset>' > /tmp/xml
+––– output –––
+––– input –––
+echo -e "source min {\n  type = xmlpipe2\n  xmlpipe_command = cat /tmp/xml\n}\n\nindex idx {\n  path = /tmp/idx\n  source = min\n}" > /tmp/xml_crash.conf
+––– output –––
+––– input –––
+indexer -c /tmp/xml_crash.conf --all 2>&1 | grep -i 'idx'
+––– output –––
+indexing table 'idx'...
+ERROR: table 'idx': source 'min': attribute 'a' is added twice (line=1, pos=143, docid=0).

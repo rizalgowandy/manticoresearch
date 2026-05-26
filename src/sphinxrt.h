@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -14,7 +14,7 @@
 #define _sphinxrt_
 
 #include "sphinxutils.h"
-#include "sphinxstem.h"
+#include "dict/stem/sphinxstem.h"
 #include "sphinxint.h"
 #include "killlist.h"
 #include "attribute.h"
@@ -27,13 +27,14 @@
 class RtAccum_t;
 
 using VisitChunk_fn = std::function<void ( const CSphIndex* pIndex )>;
+using VisitChunkEx_fn = std::function<void ( const CSphIndex* pIndex, bool bOptimizing )>;
 
-struct InsertDocData_t
+class InsertDocData_c
 {
+public:
 	CSphMatch							m_tDoc;
 	CSphVector<VecTraits_T<const char>>	m_dFields;
 	CSphVector<const char*>				m_dStrings;
-	CSphVector<int64_t>					m_dMvas;
 
 	CSphAttrLocator						m_tDocIDLocator;
 
@@ -41,10 +42,23 @@ struct InsertDocData_t
 	int									m_iColumnarID = -1;
 	int64_t								m_iTotalBytes = 0;
 
-										explicit InsertDocData_t ( const ISphSchema & tSchema );
+										explicit InsertDocData_c ( const ISphSchema & tSchema );
 
 	void								SetID ( SphAttr_t tDocID );
 	SphAttr_t							GetID() const;
+
+	void								AddMVALength ( int iLength, bool bDefault=false );
+	void								AddMVAValue ( int64_t iValue )						{ m_dMvas.Add(iValue); }
+	void								ResetMVAs()											{ m_dMvas.Resize(0); }
+	const int64_t *						GetMVA ( int iMVA ) const							{ return m_dMvas.Begin()+iMVA; }
+	void								FixParsedMVAs ( const CSphVector<int64_t> & dParsed, int iCount );
+	static std::pair<int, bool>			ReadMVALength ( const int64_t * & pMVA );
+	void								SwapMVAs ( InsertDocData_c & tSrc )					{ Swap ( m_dMvas, tSrc.m_dMvas ); }
+
+private:
+	static const uint64_t DEFAULT_FLAG = 1ULL << 63;
+
+	CSphVector<int64_t>					m_dMvas;
 };
 
 struct OptimizeTask_t
@@ -56,6 +70,7 @@ struct OptimizeTask_t
 		eSplit,
 		eMerge,
 		eAutoOptimize,
+		eDedup,
 	};
 
 	OptimizeVerb_e m_eVerb;
@@ -64,7 +79,6 @@ struct OptimizeTask_t
 	int m_iTo		=	-1;
 	bool m_bByOrder = false;
 	CSphString m_sUvarFilter;
-	CSphString m_sIndex;
 };
 
 struct CSphReconfigureSettings
@@ -92,10 +106,27 @@ struct CSphReconfigureSetup
 };
 
 /// RAM based updateable backend interface
+class RtIndex_i;
+
+struct AttachArgs_t
+{
+	RtIndex_i *	m_pSrcIndex = nullptr;
+	bool		m_bTruncate = false;
+	bool		m_bConfigless = false;
+	bool		m_bFatal = false;
+
+	AttachArgs_t ( RtIndex_i * pSrcIndex ) : m_pSrcIndex ( pSrcIndex ) {}
+};
+
 class RtIndex_i : public CSphIndexStub
 {
 public:
 	RtIndex_i ( CSphString sIndexName, CSphString sPath ) : CSphIndexStub { std::move ( sIndexName ), std::move ( sPath ) } {}
+	~RtIndex_i()
+	{
+		if ( m_fnOnDestroyed )
+			m_fnOnDestroyed();
+	}
 
 	/// get internal schema (to use for Add calls)
 	virtual const CSphSchema & GetInternalSchema () const { return m_tSchema; }
@@ -103,7 +134,7 @@ public:
 
 	/// insert/update document in current txn
 	/// fails in case of two open txns to different indexes
-	virtual bool AddDocument ( InsertDocData_t & tDoc, bool bReplace, const CSphString & sTokenFilterOptions, CSphString & sError, CSphString & sWarning, RtAccum_t * pAccExt ) = 0;
+	virtual bool AddDocument ( InsertDocData_c & tDoc, bool bReplace, const CSphString & sTokenFilterOptions, CSphString & sError, CSphString & sWarning, RtAccum_t * pAccExt ) = 0;
 
 	/// delete document in current txn
 	/// fails in case of two open txns to different indexes
@@ -111,6 +142,7 @@ public:
 
 	/// commit pending changes
 	virtual bool Commit ( int * pDeleted, RtAccum_t * pAccExt, CSphString* pError = nullptr ) = 0;
+	virtual bool PreCommit ( RtAccum_t * pAccExt, CSphString & sError ) { return true; }
 
 	/// undo pending changes
 	virtual void RollBack ( RtAccum_t * pAccExt ) = 0;
@@ -127,12 +159,21 @@ public:
 	virtual bool ForceDiskChunk () = 0;
 
 	/// attach a disk chunk to current index
-	virtual bool AttachDiskIndex ( CSphIndex * pIndex, bool bTruncate, bool & bFatal, StrVec_t & dWarnings, CSphString & sError ) { return true; }
+	virtual bool AttachDiskIndex ( CSphIndex * pIndex, bool bTruncate, bool & bFatal, CSphString & sError ) { return true; }
+
+	/// attach all the content of the RT index (flush ramchunk then disk chunks) to the current index
+	virtual bool AttachRtIndex ( AttachArgs_t & tArgs, CSphString & sError ) { return true; }
 
 	/// truncate index (that is, kill all data)
-	virtual bool Truncate ( CSphString & sError ) = 0;
+	enum Truncate_e : bool { TRUNCATE, DROP };
+	virtual bool Truncate ( CSphString & sError, Truncate_e eAction ) = 0;
 
 	virtual void Optimize ( OptimizeTask_t tTask ) {}
+	virtual bool StartOptimize ( OptimizeTask_t tTask ) { return true; }
+	virtual int OptimizesRunning () const noexcept { return 0; }
+	virtual void ManualOptimizeCutoff ( int iCutoff ) {}
+
+	virtual int GetNumOfLocks () const noexcept { return 0; }
 
 	/// check settings vs current and return back tokenizer and dictionary in case of difference
 	virtual bool IsSameSettings ( CSphReconfigureSettings & tSettings, CSphReconfigureSetup & tSetup, StrVec_t & dWarnings, CSphString & sError ) const = 0;
@@ -147,12 +188,7 @@ public:
 	/// do something const with disk chunk (query settings, status, etc.)
 	/// hides internal disk chunks storage
 	virtual void ProcessDiskChunk ( int iChunk, VisitChunk_fn&& fnVisitor ) const {};
-
-	/// get disk chunk
-	virtual CSphIndex* GetDiskChunk ( int iChunk )
-	{
-		return nullptr;
-	}
+	virtual void ProcessDiskChunkEx ( int iChunk, VisitChunkEx_fn&& fnVisitor ) const {};
 
 	/// bind indexing accumulator
 	/// returns false if another index already uses it in an open txn
@@ -162,22 +198,34 @@ public:
 	virtual TokenizerRefPtr_c CloneIndexingTokenizer() const = 0;
 
 	// hint an index that it was deleted and should cleanup its files when destructed
-	virtual void IndexDeleted() = 0;
+	void IndexDeleted ( Threads::Handler&& fnOnDestroyed )
+	{
+		m_bIndexDeleted = true;
+		m_fnOnDestroyed = std::move ( fnOnDestroyed );
+	}
 
 	virtual void ProhibitSave() = 0;
 	virtual void EnableSave() = 0;
 	virtual void LockFileState ( CSphVector<CSphString> & dFiles ) = 0;
+
+	virtual void WaitLockEnabledState() noexcept {};
+	virtual void UnlockEnabledState () noexcept {};
 	
 	virtual bool	NeedStoreWordID () const = 0;
 	virtual	int64_t	GetMemLimit() const = 0;
+	virtual int		GetChunkId () const { return 0; };
 
 protected:
 	bool PrepareAccum ( RtAccum_t* pAccExt, bool bWordDict, CSphString* pError );
+	bool				m_bIndexDeleted = false;
+
+private:
+	Threads::Handler	m_fnOnDestroyed = nullptr;
 };
 
 /// initialize subsystem
 class CSphConfigSection;
-void sphRTInit ( const CSphConfigSection & hSearchd, bool bTestMode, const CSphConfigSection * pCommon );
+void sphRTInit ( CSphString sBinlogPath, bool bCommonBinlog = false, const CSphConfigSection * pCommon = nullptr );
 bool sphRTSchemaConfigure ( const CSphConfigSection & hIndex, CSphSchema & tSchema, const CSphIndexSettings & tSettings, StrVec_t * pWarnings, CSphString & sError, bool bSkipValidation, bool bPQ );
 void sphRTSetTestMode ();
 
@@ -191,7 +239,7 @@ typedef void ProgressCallbackSimple_t ();
 /// Exposed internal stuff (for pq and for testing)
 
 #define SPH_MAX_KEYWORD_LEN (3*SPH_MAX_WORD_LEN+4)
-STATIC_ASSERT ( SPH_MAX_KEYWORD_LEN<255, MAX_KEYWORD_LEN_SHOULD_FITS_BYTE );
+static_assert ( SPH_MAX_KEYWORD_LEN<255, "SPH_MAX_KEYWORD_LEN should fit in byte" );
 
 struct RtDoc_t
 {
@@ -222,7 +270,7 @@ struct RtWordCheckpoint_t
 	union
 	{
 		SphWordID_t m_uWordID;
-		const char * m_sWord;
+		const char * m_szWord;
 	};
 	int m_iOffset;
 };
@@ -247,7 +295,7 @@ public:
 	CSphTightVector<BYTE>			m_dBlobs GUARDED_BY ( m_tLock );            ///< storage for blob attrs
 	CSphVector<BYTE>				m_dKeywordCheckpoints;
 	std::atomic<int64_t> *			m_pRAMCounter = nullptr;///< external RAM counter
-	OpenHash_T<RowID_t, DocID_t>	m_tDocIDtoRowID;		///< speeds up docid-rowid lookups
+	OpenHashTable_T<DocID_t, RowID_t>	m_tDocIDtoRowID;		///< speeds up docid-rowid lookups
 	DeadRowMap_Ram_c				m_tDeadRowMap;
 	std::unique_ptr<DocstoreRT_i>	m_pDocstore;
 	std::unique_ptr<ColumnarRT_i>	m_pColumnar;
@@ -262,7 +310,7 @@ public:
 	DWORD					GetMergeFactor() const;
 	int						GetStride() const;
 
-	const CSphRowitem * 	FindAliveRow ( DocID_t tDocid ) const;
+	bool					IsAlive ( DocID_t tDocid ) const;
 	const CSphRowitem *		GetDocinfoByRowID ( RowID_t tRowID ) const;
 	RowID_t					GetAliveRowidByDocid ( DocID_t tDocid ) const;
 	RowID_t					GetRowidByDocid ( DocID_t tDocID ) const;
@@ -374,11 +422,11 @@ protected:
 	CSphVector<int>				m_dFieldLengths;
 };
 
-
-#define BLOOM_PER_ENTRY_VALS_COUNT 8
-#define BLOOM_HASHES_COUNT 2
-#define BLOOM_NGRAM_0 2
-#define BLOOM_NGRAM_1 4
+static constexpr DWORD PERCOLATE_BLOOM_WILD_COUNT = 32;
+static constexpr DWORD BLOOM_PER_ENTRY_VALS_COUNT = 8;
+static constexpr DWORD BLOOM_HASHES_COUNT = 2;
+static constexpr DWORD BLOOM_NGRAM_0 = 2;
+static constexpr DWORD BLOOM_NGRAM_1 = 4;
 
 struct BloomGenTraits_t
 {
@@ -393,7 +441,7 @@ struct BloomGenTraits_t
 		m_pBuf[iPos] |= uVal;
 	}
 
-	bool IterateNext () const
+	bool IterateNext () const noexcept
 	{ return true; }
 };
 
@@ -411,7 +459,7 @@ struct BloomCheckTraits_t
 		m_bSame = ( ( m_pBuf[iPos] & uVal )==uVal );
 	}
 
-	bool IterateNext () const
+	bool IterateNext () const noexcept
 	{ return m_bSame; }
 };
 
@@ -439,9 +487,12 @@ volatile bool &RTChangesAllowed () noexcept;
 
 // Get global flag of autooptimize
 volatile int & AutoOptimizeCutoffMultiplier() noexcept;
+volatile int & ParallelChunkMergesLimit() noexcept;
+volatile int & MergeChunksPerJob() noexcept;
 volatile int AutoOptimizeCutoff() noexcept;
+volatile int AutoOptimizeCutoffKNN() noexcept;
+volatile int & KNNParallelBuild() noexcept;
 
-using OptimizeExecutorFnPtr = void (*) ( OptimizeTask_t );
-volatile OptimizeExecutorFnPtr& OptimizeExecutor() noexcept;
+void SetRtFlushDiskPeriod ( int iFlushWrite, int iFlushSearch );
 
 #endif // _sphinxrt_

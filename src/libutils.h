@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -12,6 +12,9 @@
 
 #pragma once
 
+// HAVE_DLOPEN
+#include "config.h"
+#if HAVE_DLOPEN
 #if _WIN32
 	#define RTLD_LAZY		0
 	#define RTLD_NOW		0
@@ -22,38 +25,41 @@
 	void *			dlopen ( const char * libname, int );
 	int				dlclose ( void * lib );
 	const char *	dlerror();
-#else // !_WIN32
-#include "config.h"
-#if HAVE_DLOPEN
+#else
 #	include <dlfcn.h>
+#endif
 #endif // HAVE_DLOPEN
-#endif // _WIN32
-
-#if HAVE_DLOPEN
-
+#include "std/string.h"
 #include <utility>
 
-class ScopedHandle_c
+
+class ScopedHandle_c final
 {
 public:
-	ScopedHandle_c ( void * pHandle )
+	explicit ScopedHandle_c ( void * pHandle )
 		: m_pHandle ( pHandle )
 	{}
 
-	~ScopedHandle_c()
-	{
-		if ( m_pHandle )
-			dlclose ( m_pHandle );
-	}
+	~ScopedHandle_c();
 
-	void * Leak()
+	void * Leak() noexcept
 	{
 		return std::exchange ( m_pHandle, nullptr );
 	}
 
-	void * Get() { return m_pHandle; }
+	void * Get() const noexcept { return m_pHandle; }
 
 private:
 	void * m_pHandle = nullptr;
 };
-#endif // HAVE_DLOPEN
+
+void * DlSym ( void * pHandle, const char * szFunc, const CSphString & sLib, CSphString & sError );
+
+template<typename T>
+bool LoadFunc ( T & pFunc, void * pHandle, const char * szFunc, const CSphString & sLib, CSphString & sError )
+{
+	pFunc = (T) DlSym ( pHandle, szFunc, sLib, sError  );
+	return !!pFunc;
+}
+
+CSphString TryDifferentPaths ( const CSphString & sLibfile, const CSphString & sFullpath, int iVersion, const char * szPostfix = nullptr );

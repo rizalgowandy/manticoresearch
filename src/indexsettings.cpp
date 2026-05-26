@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -15,12 +15,17 @@
 #include "sphinxstd.h"
 #include "sphinxint.h"
 #include "fileutils.h"
-#include "sphinxstem.h"
+#include "dict/stem/sphinxstem.h"
 #include "icu.h"
+#include "jieba.h"
 #include "attribute.h"
+#include "knnmisc.h"
 #include "indexfiles.h"
 #include "tokenizer/tokenizer.h"
 #include "client_task_info.h"
+#include "knnlib.h"
+#include "secondarylib.h"
+#include "embeddingutils.h"
 
 #if !_WIN32
 	#include <glob.h>
@@ -61,9 +66,31 @@ static const char * BigramName ( ESphBigram eType )
 	case SPH_BIGRAM_BOTHFREQ:
 		return "both_freq";
 
+	case SPH_BIGRAM_SECONDNUMERIC:
+		return "second_numeric";
+
+	case SPH_BIGRAM_SECONDHASDIGIT:
+		return "second_has_digit";
+
 	case SPH_BIGRAM_NONE:
 	default:
 		return "none";
+	}
+}
+
+static const char * BigramDelimiterName ( BigramDelimiter_e eType )
+{
+	switch ( eType )
+	{
+	case BigramDelimiter_e::NONE:
+		return "none";
+
+	case BigramDelimiter_e::BOTH:
+		return "both";
+
+	case BigramDelimiter_e::DELIMITED:
+	default:
+		return "true";
 	}
 }
 
@@ -110,7 +137,7 @@ SettingsFormatterState_t::SettingsFormatterState_t ( StringBuilder_c & tBuf )
 class SettingsFormatter_c
 {
 public:
-				SettingsFormatter_c ( SettingsFormatterState_t & tState, const char * szPrefix, const char * szEq, const char * szPostfix, const char * szSeparator, bool bIgnoreConf = false );
+				SettingsFormatter_c ( SettingsFormatterState_t & tState, const char * szPrefix, const char * szEq, const char * szPostfix, const char * szSeparator, bool bIgnoreConf = false, bool bEscapeValues = false, ExtFilesFormat_e eExt = ExtFilesFormat_e::FILE );
 
 	template <typename T>
 	void		Add ( const char * szKey, T tVal, bool bCond );
@@ -119,23 +146,56 @@ public:
 	void		AddEmbedded ( const char * szKey, const VecTraits_T<T> & dEmbedded, bool bCond );
 
 private:
+	template <typename T>
+	CSphString FormatValue(T tVal);
+
 	SettingsFormatterState_t & m_tState;
 	CSphString			m_sPrefix;
 	CSphString			m_sEq;
 	CSphString			m_sPostfix;
 	CSphString			m_sSeparator;
 	bool				m_bIgnoreCond = false;
+	bool				m_bEscapeValues = false;
+
+public:
+	const ExtFilesFormat_e m_eExt = ExtFilesFormat_e::FILE;
 };
 
 
-SettingsFormatter_c::SettingsFormatter_c ( SettingsFormatterState_t & tState, const char * szPrefix, const char * szEq, const char * szPostfix, const char * szSeparator, bool bIgnoreCond )
-	: m_tState		( tState )
-	, m_sPrefix		( szPrefix )
-	, m_sEq			( szEq )
-	, m_sPostfix	( szPostfix )
-	, m_sSeparator	( szSeparator )
-	, m_bIgnoreCond	( bIgnoreCond )
+SettingsFormatter_c::SettingsFormatter_c ( SettingsFormatterState_t & tState, const char * szPrefix, const char * szEq, const char * szPostfix, const char * szSeparator, bool bIgnoreCond, bool bEscapeValues, ExtFilesFormat_e eExt )
+	: m_tState			( tState )
+	, m_sPrefix			( szPrefix )
+	, m_sEq				( szEq )
+	, m_sPostfix		( szPostfix )
+	, m_sSeparator		( szSeparator )
+	, m_bIgnoreCond		( bIgnoreCond )
+	, m_bEscapeValues	( bEscapeValues )
+	, m_eExt ( eExt )
 {}
+
+using SqlEscapedBuilder_c = EscapedStringBuilder_T<BaseQuotation_T<SqlQuotator_t>>;
+
+template<typename T>
+CSphString SettingsFormatter_c::FormatValue(T tVal) {
+	SqlEscapedBuilder_c dEscaped;
+
+	// convert tVal to CSphString
+	CSphString sVal;
+	dEscaped << tVal;
+	dEscaped.MoveTo(sVal);
+
+	if (!m_bEscapeValues) {
+		// return plain string
+		return sVal;
+	}
+
+	// build escaped string
+	CSphString sRes;
+	dEscaped.AppendEscapedSkippingCommaNoQuotes(sVal.cstr());
+	dEscaped.MoveTo( sRes);
+
+	return sRes;
+}
 
 template <typename T>
 void SettingsFormatter_c::Add ( const char * szKey, T tVal, bool bCond )
@@ -148,7 +208,7 @@ void SettingsFormatter_c::Add ( const char * szKey, T tVal, bool bCond )
 		if ( !m_tState.m_bFirst )
 			(*m_tState.m_pBuf) << m_sSeparator;
 
-		(*m_tState.m_pBuf) << m_sPrefix << szKey << m_sEq << tVal << m_sPostfix;
+		(*m_tState.m_pBuf) << m_sPrefix << szKey << m_sEq << FormatValue(tVal) << m_sPostfix;
 	}
 
 	if ( m_tState.m_pFile )
@@ -157,7 +217,7 @@ void SettingsFormatter_c::Add ( const char * szKey, T tVal, bool bCond )
 		if ( !m_tState.m_bFirst )
 			tBuilder << m_sSeparator;
 
-		tBuilder << m_sPrefix << szKey << m_sEq << tVal << m_sPostfix;
+		tBuilder << m_sPrefix << szKey << m_sEq << FormatValue(tVal) << m_sPostfix;
 		fputs ( tBuilder.cstr(), m_tState.m_pFile );
 	}
 
@@ -204,7 +264,8 @@ static RtTypedAttr_t g_dRtTypedAttrs[]=
 	{ SPH_ATTR_STRING,		"rt_attr_string" },
 	{ SPH_ATTR_JSON,		"rt_attr_json" },
 	{ SPH_ATTR_UINT32SET,	"rt_attr_multi" },
-	{ SPH_ATTR_INT64SET,	"rt_attr_multi_64" }
+	{ SPH_ATTR_INT64SET,	"rt_attr_multi_64" },
+	{ SPH_ATTR_FLOAT_VECTOR,"rt_attr_float_vector" }
 };
 
 
@@ -220,9 +281,9 @@ const RtTypedAttr_t & GetRtType ( int iType )
 }
 
 
-static CSphString FormatPath ( const CSphString & sFile, const FilenameBuilder_i * pFilenameBuilder )
+CSphString FormatPath ( const CSphString & sFile, const FilenameBuilder_i * pFilenameBuilder )
 {
-	if ( !pFilenameBuilder || sFile.IsEmpty() )
+	if ( !pFilenameBuilder || sFile.IsEmpty() || IsPathAbsolute ( sFile ) )
 		return sFile;
 
 	return pFilenameBuilder->GetFullPath(sFile);
@@ -295,7 +356,7 @@ void CSphTokenizerSettings::Setup ( const CSphConfigSection & hIndex, CSphString
 			sWarning = "ngram_chars specified, but ngram_len=0; IGNORED";
 	}
 
-	m_sCaseFolding = hIndex.GetStr ( "charset_table", "non_cjk" );
+	m_sCaseFolding = hIndex.GetStr ( "charset_table", "non_cont" );
 	m_iMinWordLen = Max ( hIndex.GetInt ( "min_word_len", 1 ), 1 );
 	m_sNgramChars = hIndex.GetStr ( "ngram_chars" );
 	m_sSynonymsFile = hIndex.GetStr ( "exceptions" ); // new option name
@@ -356,11 +417,15 @@ bool CSphTokenizerSettings::Load ( const FilenameBuilder_i* pFilenameBuilder, co
 
 	m_sCaseFolding = String ( tNode.ChildByName ( "case_folding" ) );
 	m_iMinWordLen = (int)Int ( tNode.ChildByName ( "min_word_len" ), 1 );
+
 	auto tSynonymsNode = tNode.ChildByName ( "synonyms" );
-	if ( !IsNullNode ( tSynonymsNode ) )
+	tEmbeddedFiles.m_bEmbeddedSynonyms = !IsNullNode ( tSynonymsNode );
+	if ( tEmbeddedFiles.m_bEmbeddedSynonyms )
+	{
 		Bson_c ( tSynonymsNode ).ForEach ( [&tEmbeddedFiles] ( const NodeHandle_t& tNode ) {
 			tEmbeddedFiles.m_dSynonyms.Add ( String (tNode));
 		} );
+	}
 
 	m_sSynonymsFile = String ( tNode.ChildByName ( "synonyms_file" ) );
 	if ( !m_sSynonymsFile.IsEmpty() )
@@ -379,6 +444,8 @@ bool CSphTokenizerSettings::Load ( const FilenameBuilder_i* pFilenameBuilder, co
 	return true;
 }
 
+static void FormatFileContent ( const CSphString & sFile, FilenameBuilder_i * pFilenameBuilder, bool bSplitLine, StringBuilder_c & sRes );
+static void FormatFileContent ( const VecTraits_T<CSphString> & dFiles, FilenameBuilder_i * pFilenameBuilder, bool bSplitLine, StringBuilder_c & sRes );
 
 void CSphTokenizerSettings::Format ( SettingsFormatter_c & tOut, FilenameBuilder_i * pFilenameBuilder ) const
 {
@@ -386,7 +453,7 @@ void CSphTokenizerSettings::Format ( SettingsFormatter_c & tOut, FilenameBuilder
 	tOut.Add ( "charset_type",		bKnownTokenizer ? "utf-8" : "unknown tokenizer (deprecated sbcs?)", !bKnownTokenizer );
 
 	// fixme! need unified default charset handling
-	tOut.Add ( "charset_table",		m_sCaseFolding,	!m_sCaseFolding.IsEmpty() && m_sCaseFolding!="non_cjk" );
+	tOut.Add ( "charset_table",		m_sCaseFolding,	!m_sCaseFolding.IsEmpty() && m_sCaseFolding!="non_cont" );
 	tOut.Add ( "min_word_len",		m_iMinWordLen,	m_iMinWordLen>1 );
 	tOut.Add ( "ngram_len",			m_iNgramLen,	m_iNgramLen && !m_sNgramChars.IsEmpty() );
 	tOut.Add ( "ngram_chars",		m_sNgramChars,	m_iNgramLen && !m_sNgramChars.IsEmpty() );
@@ -395,8 +462,16 @@ void CSphTokenizerSettings::Format ( SettingsFormatter_c & tOut, FilenameBuilder
 	tOut.Add ( "blend_chars",		m_sBlendChars,	!m_sBlendChars.IsEmpty() );
 	tOut.Add ( "blend_mode",		m_sBlendMode,	!m_sBlendMode.IsEmpty() );
 
-	CSphString sSynonymsFile = FormatPath ( m_sSynonymsFile, pFilenameBuilder );
-	tOut.Add ( "exceptions",		sSynonymsFile,	!sSynonymsFile.IsEmpty() );
+	if ( tOut.m_eExt==ExtFilesFormat_e::FILE )
+	{
+		CSphString sSynonymsFile = FormatPath ( m_sSynonymsFile, pFilenameBuilder );
+		tOut.Add ( "exceptions",		sSynonymsFile,	!sSynonymsFile.IsEmpty() );
+	} else
+	{
+		StringBuilder_c sSynonymsContent ( "; " );
+		FormatFileContent ( m_sSynonymsFile, pFilenameBuilder, false, sSynonymsContent );
+		tOut.Add ( "exceptions_list", sSynonymsContent.cstr(), !sSynonymsContent.IsEmpty() );
+	}
 }
 
 
@@ -447,7 +522,7 @@ void CSphDictSettings::Setup ( const CSphConfigSection & hIndex, FilenameBuilder
 }
 
 
-void CSphDictSettings::Load ( CSphReader & tReader, CSphEmbeddedFiles & tEmbeddedFiles, CSphString & sWarning )
+void CSphDictSettings::Load ( CSphReader & tReader, CSphEmbeddedFiles & tEmbeddedFiles, FilenameBuilder_i * pFilenameBuilder, CSphString & sWarning )
 {
 	m_sMorphology = tReader.GetString();
 	m_sMorphFields = tReader.GetString();
@@ -469,7 +544,7 @@ void CSphDictSettings::Load ( CSphReader & tReader, CSphEmbeddedFiles & tEmbedde
 	tEmbeddedFiles.m_dStopwordFiles.Resize ( nFiles );
 	for ( int i = 0; i < nFiles; i++ )
 	{
-		sFile = tReader.GetString ();
+		sFile = FormatPath ( tReader.GetString (), pFilenameBuilder );
 		tEmbeddedFiles.m_dStopwordFiles[i].Read ( tReader, sFile.cstr(), true, tEmbeddedFiles.m_bEmbeddedSynonyms ? NULL : &sWarning );
 	}
 
@@ -489,7 +564,8 @@ void CSphDictSettings::Load ( CSphReader & tReader, CSphEmbeddedFiles & tEmbedde
 	ARRAY_FOREACH ( i, m_dWordforms )
 	{
 		m_dWordforms[i] = tReader.GetString();
-		tEmbeddedFiles.m_dWordformFiles[i].Read ( tReader, m_dWordforms[i].cstr(), false, tEmbeddedFiles.m_bEmbeddedWordforms ? NULL : &sWarning );
+		sFile = FormatPath ( m_dWordforms[i], pFilenameBuilder );
+		tEmbeddedFiles.m_dWordformFiles[i].Read ( tReader, sFile.cstr(), false, tEmbeddedFiles.m_bEmbeddedWordforms ? NULL : &sWarning );
 	}
 
 	m_iMinStemmingLen = tReader.GetDword ();
@@ -501,8 +577,9 @@ void CSphDictSettings::Load ( CSphReader & tReader, CSphEmbeddedFiles & tEmbedde
 }
 
 
-void CSphDictSettings::Load ( const bson::Bson_c& tNode, CSphEmbeddedFiles& tEmbeddedFiles, CSphString& sWarning )
+void CSphDictSettings::Load ( const bson::Bson_c& tNode, CSphEmbeddedFiles& tEmbeddedFiles, FilenameBuilder_i * pFilenameBuilder, CSphString& sWarning )
 {
+	CSphString sFile;
 	using namespace bson;
 	m_sMorphology = String ( tNode.ChildByName ( "morphology" ) );
 	m_sMorphFields = String ( tNode.ChildByName ( "morph_fields" ) );
@@ -526,18 +603,22 @@ void CSphDictSettings::Load ( const bson::Bson_c& tNode, CSphEmbeddedFiles& tEmb
 
 	auto tStopwordsNode = tNode.ChildByName ( "stopwords_file_infos" );
 	if ( !IsNullNode ( tStopwordsNode ) )
-		Bson_c ( tStopwordsNode ).ForEach ( [&tEmbeddedFiles,&sWarning] ( const NodeHandle_t& tNode ) {
-			auto& tStopwordsFile = tEmbeddedFiles.m_dStopwordFiles.Add();
-			tStopwordsFile.Read ( Bson_c ( tNode ).ChildByName ( "info" ), String ( Bson_c ( tNode ).ChildByName ( "name" ) ).cstr(), true, tEmbeddedFiles.m_bEmbeddedStopwords ? nullptr : &sWarning );
+		Bson_c ( tStopwordsNode ).ForEach ( [ &tEmbeddedFiles, &sWarning, &sFile, &pFilenameBuilder ] ( const NodeHandle_t& tNode )
+		{
+			auto & tStopwordsFile = tEmbeddedFiles.m_dStopwordFiles.Add();
+			sFile = FormatPath ( String ( Bson_c ( tNode ).ChildByName ( "name" ) ), pFilenameBuilder );
+			tStopwordsFile.Read ( Bson_c ( tNode ).ChildByName ( "info" ), sFile.cstr(), true, tEmbeddedFiles.m_bEmbeddedStopwords ? nullptr : &sWarning );
 		} );
 
 	auto tWordformsFiles = tNode.ChildByName ( "wordforms_file_infos" );
 	if ( !IsNullNode ( tWordformsFiles ) )
-		Bson_c ( tWordformsFiles ).ForEach ( [&tEmbeddedFiles, &sWarning,this] ( const NodeHandle_t& tNode ) {
-			auto& dWordformsFileName = m_dWordforms.Add();
-			auto& tWordformsFile = tEmbeddedFiles.m_dWordformFiles.Add();
-			dWordformsFileName = String ( Bson_c ( tNode ).ChildByName ( "name" ) );
-			tWordformsFile.Read ( Bson_c ( tNode ).ChildByName ( "info" ), dWordformsFileName.cstr(), false, tEmbeddedFiles.m_bEmbeddedWordforms ? nullptr : &sWarning );
+		Bson_c ( tWordformsFiles ).ForEach ( [ &tEmbeddedFiles, &sWarning, this, &sFile, &pFilenameBuilder ] ( const NodeHandle_t& tNode )
+		{
+			auto & sWordformsFileName = m_dWordforms.Add();
+			auto & tWordformsFile = tEmbeddedFiles.m_dWordformFiles.Add();
+			sWordformsFileName = String ( Bson_c ( tNode ).ChildByName ( "name" ) );
+			sFile = FormatPath ( sWordformsFileName, pFilenameBuilder );
+			tWordformsFile.Read ( Bson_c ( tNode ).ChildByName ( "info" ), sFile.cstr(), false, tEmbeddedFiles.m_bEmbeddedWordforms ? nullptr : &sWarning );
 		} );
 
 	m_iMinStemmingLen = (int)Int ( tNode.ChildByName ( "min_stemming_len" ), 1 );
@@ -555,14 +636,27 @@ void CSphDictSettings::Format ( SettingsFormatter_c & tOut, FilenameBuilder_i * 
 	tOut.Add ( "min_stemming_len",		m_iMinStemmingLen,	m_iMinStemmingLen>1 );
 	tOut.Add ( "stopwords_unstemmed",	1,					m_bStopwordsUnstemmed );
 
-	CSphString sStopwordsFile = FormatPath ( m_sStopwords, pFilenameBuilder );
-	tOut.Add ( "stopwords",				sStopwordsFile,		!sStopwordsFile.IsEmpty() );
+	if ( tOut.m_eExt==ExtFilesFormat_e::FILE )
+	{
+		CSphString sStopwordsFile = FormatPath ( m_sStopwords, pFilenameBuilder );
+		tOut.Add ( "stopwords", sStopwordsFile, !sStopwordsFile.IsEmpty() );
 
-	StringBuilder_c sAllWordforms(" ");
-	for ( const auto & i : m_dWordforms )
-		sAllWordforms << FormatPath ( i, pFilenameBuilder );
+		StringBuilder_c sAllWordforms(" ");
+		for ( const auto & i : m_dWordforms )
+			sAllWordforms << FormatPath ( i, pFilenameBuilder );
 
-	tOut.Add ( "wordforms",	sAllWordforms.cstr(), !sAllWordforms.IsEmpty() );
+		tOut.Add ( "wordforms",	sAllWordforms.cstr(), !sAllWordforms.IsEmpty() );
+
+	} else
+	{
+		StringBuilder_c sStopwordsContent ( "; " );
+		FormatFileContent ( m_sStopwords, pFilenameBuilder, true, sStopwordsContent );
+		tOut.Add ( "stopwords_list", sStopwordsContent.cstr(), !sStopwordsContent.IsEmpty() );
+
+		StringBuilder_c sWordformContent ( "; " );
+		FormatFileContent ( m_dWordforms, pFilenameBuilder, false, sWordformContent );
+		tOut.Add ( "wordforms_list",	sWordformContent.cstr(), !sWordformContent.IsEmpty() );
+	}
 }
 
 
@@ -773,9 +867,42 @@ bool CSphIndexSettings::ParseColumnarSettings ( const CSphConfigSection & hIndex
 		m_dColumnarStringsNoHash.Uniq();
 	}
 
-	m_sCompressionUINT32 = hIndex.GetStr ( "columnar_compression_uint32", m_sCompressionUINT32.c_str() ).cstr();
-	m_sCompressionUINT64 = hIndex.GetStr ( "columnar_compression_int64", m_sCompressionUINT64.c_str() ).cstr();
-	m_iSubblockSize = hIndex.GetInt ( "columnar_subblock", m_iSubblockSize );
+	return true;
+}
+
+
+bool CSphIndexSettings::ParseKNNSettings ( const CSphConfigSection & hIndex, CSphString & sError )
+{
+	if ( !hIndex.Exists("knn") )
+		return true;
+
+	if ( !IsKNNLibLoaded() )
+	{
+		sError = "knn library not loaded";
+		return false;
+	}
+
+	return ParseKNNConfigStr ( hIndex.GetStr("knn"), m_dKNN, sError );
+}
+
+
+bool CSphIndexSettings::ParseSISettings ( const CSphConfigSection & hIndex, CSphString & sError )
+{
+	if ( !hIndex.Exists("json_secondary_indexes") )
+		return true;
+
+	if ( !IsSecondaryLibLoaded() )
+	{
+		sError = "secondary index library not loaded";
+		return false;
+	}
+
+	{
+		CSphString sAttrs = hIndex.GetStr ( "json_secondary_indexes" );
+		sAttrs.ToLower();
+		sphSplit ( m_dJsonSIAttrs, sAttrs.cstr() );
+		m_dJsonSIAttrs.Uniq();
+	}
 
 	return true;
 }
@@ -799,16 +926,66 @@ bool CSphIndexSettings::ParseDocstoreSettings ( const CSphConfigSection & hIndex
 		m_eCompression = Compression_e::LZ4HC;
 	else
 	{
-		sError.SetSprintf ( "unknown compression specified in 'docstore_compression': '%s'\n", sCompression.cstr() ); 
+		sError.SetSprintf ( "unknown compression specified in 'docstore_compression': '%s'\n", sCompression.cstr() );
 		return false;
 	}
 
 	if ( hIndex.Exists("docstore_compression_level") && m_eCompression!=Compression_e::LZ4HC )
-		sWarning.SetSprintf ( "docstore_compression_level works only with LZ4HC compression" ); 
+		sWarning.SetSprintf ( "docstore_compression_level works only with LZ4HC compression" );
 
 	return true;
 }
 
+
+bool CSphIndexSettings::ParseCJKSegmentation ( const CSphConfigSection & hIndex, const StrVec_t & dMorphs, CSphString & sWarning, CSphString & sError )
+{
+	bool bICU = dMorphs.Contains ( "icu_chinese" );
+	bool bJieba = dMorphs.Contains ( "jieba_chinese" );
+
+	if ( bICU && bJieba )
+	{
+		sError = "ICU and Jieba cannot both be enabled at the same time";
+		return false;
+	}
+	else
+		m_ePreprocessor = bICU ? Preprocessor_e::ICU : ( bJieba ? Preprocessor_e::JIEBA : Preprocessor_e::NONE );
+
+	if ( !sphCheckConfigICU ( *this, sError ) )
+		return false;
+
+	if ( !CheckConfigJieba ( *this, sError ) )
+		return false;
+
+	if ( hIndex.Exists("jieba_hmm") && m_ePreprocessor!=Preprocessor_e::JIEBA )
+	{
+		sError = "jieba_hmm can't be used without Jieba morphology enabled";
+		return false;
+	}
+
+	if ( hIndex.Exists("jieba_mode") && m_ePreprocessor!=Preprocessor_e::JIEBA )
+	{
+		sError = "jieba_mode can't be used without Jieba morphology enabled";
+		return false;
+	}
+
+	if ( hIndex.Exists("jieba_user_dict_path") && m_ePreprocessor!=Preprocessor_e::JIEBA )
+	{
+		sError = "jieba_user_dict_path can't be used without Jieba morphology enabled";
+		return false;
+	}
+
+	m_bJiebaHMM = hIndex.GetBool ( "jieba_hmm", true );
+	CSphString sJiebaMode = hIndex.GetStr ( "jieba_mode", "accurate" );
+	if ( !StrToJiebaMode ( m_eJiebaMode , sJiebaMode, sError ) )
+		return false;
+
+	if ( m_eJiebaMode==JiebaMode_e::FULL && hIndex.Exists("jieba_hmm")  )
+		sWarning = "jieba_hmm has no effect when jieba_mode=full";
+
+	m_sJiebaUserDictPath = hIndex.GetStr("jieba_user_dict_path");
+
+	return true;
+}
 
 static const int64_t DEFAULT_ATTR_UPDATE_RESERVE = 131072;
 
@@ -826,6 +1003,7 @@ bool CSphIndexSettings::Setup ( const CSphConfigSection & hIndex, const char * s
 	m_bIndexFieldLens = hIndex.GetInt ( "index_field_lengths" )!=0;
 	m_sIndexTokenFilter = hIndex.GetStr ( "index_token_filter" );
 	m_tBlobUpdateSpace = hIndex.GetSize64 ( "attr_update_reserve", DEFAULT_ATTR_UPDATE_RESERVE );
+	m_bBinlog = hIndex.GetBool ( "binlog", true );
 
 	if ( !m_tKlistTargets.Parse ( hIndex.GetStr ( "killlist_target" ), szIndexName, sError ) )
 		return false;
@@ -844,6 +1022,12 @@ bool CSphIndexSettings::Setup ( const CSphConfigSection & hIndex, const char * s
 	ParseStoredFields(hIndex);
 
 	if ( !ParseColumnarSettings ( hIndex, sError ) )
+		return false;
+
+	if ( !ParseKNNSettings ( hIndex, sError ) )
+		return false;
+
+	if ( !ParseSISettings ( hIndex, sError ) )
 		return false;
 
 	if ( RawMinPrefixLen()==0 && m_dPrefixFields.GetLength()!=0 )
@@ -962,9 +1146,31 @@ bool CSphIndexSettings::Setup ( const CSphConfigSection & hIndex, const char * s
 			m_eBigramIndex = SPH_BIGRAM_FIRSTFREQ;
 		else if ( s=="both_freq" )
 			m_eBigramIndex = SPH_BIGRAM_BOTHFREQ;
+		else if ( s=="second_numeric" )
+			m_eBigramIndex = SPH_BIGRAM_SECONDNUMERIC;
+		else if ( s=="second_has_digit" )
+			m_eBigramIndex = SPH_BIGRAM_SECONDHASDIGIT;
 		else
 		{
-			sError.SetSprintf ( "unknown bigram_index=%s (must be all, first_freq, or both_freq)", s.cstr() );
+			sError.SetSprintf ( "unknown bigram_index=%s (must be all, first_freq, both_freq, second_numeric, or second_has_digit)", s.cstr() );
+			return false;
+		}
+	}
+
+	m_eBigramDelimiter = BigramDelimiter_e::DEFAULT;
+	if ( hIndex("bigram_delimiter") )
+	{
+		CSphString s = hIndex["bigram_delimiter"].strval();
+		s.ToLower();
+		if ( s=="true" )
+			m_eBigramDelimiter = BigramDelimiter_e::DELIMITED;
+		else if ( s=="none" )
+			m_eBigramDelimiter = BigramDelimiter_e::NONE;
+		else if ( s=="both" )
+			m_eBigramDelimiter = BigramDelimiter_e::BOTH;
+		else
+		{
+			sError.SetSprintf ( "unknown bigram_delimiter=%s (must be true, none, or both)", s.cstr() );
 			return false;
 		}
 	}
@@ -972,7 +1178,7 @@ bool CSphIndexSettings::Setup ( const CSphConfigSection & hIndex, const char * s
 	m_sBigramWords = hIndex.GetStr ( "bigram_freq_words" );
 	m_sBigramWords.Trim();
 
-	bool bEmptyOk = m_eBigramIndex==SPH_BIGRAM_NONE || m_eBigramIndex==SPH_BIGRAM_ALL;
+	bool bEmptyOk = !BigramNeedsFreq ( m_eBigramIndex );
 	if ( bEmptyOk!=m_sBigramWords.IsEmpty() )
 	{
 		sError.SetSprintf ( "bigram_index=%s, bigram_freq_words must%s be empty", hIndex["bigram_index"].cstr(),
@@ -988,7 +1194,8 @@ bool CSphIndexSettings::Setup ( const CSphConfigSection & hIndex, const char * s
 	for ( int j=0; j<AOT_LENGTH; ++j )
 	{
 		char buf_all[20];
-		sprintf ( buf_all, "lemmatize_%s_all", AOT_LANGUAGES[j] ); //NOLINT
+		snprintf ( buf_all, 19, "lemmatize_%s_all", AOT_LANGUAGES[j] ); //NOLINT
+		buf_all[19] = '\0';
 		ARRAY_FOREACH ( i, dMorphs )
 			if ( dMorphs[i]==buf_all )
 			{
@@ -997,9 +1204,7 @@ bool CSphIndexSettings::Setup ( const CSphConfigSection & hIndex, const char * s
 			}
 	}
 
-	m_ePreprocessor = dMorphs.Contains ( "icu_chinese" ) ? Preprocessor_e::ICU : Preprocessor_e::NONE;
-
-	if ( !sphCheckConfigICU ( *this, sError ) )
+	if ( !ParseCJKSegmentation ( hIndex, dMorphs, sWarning, sError ) )
 		return false;
 
 	// all good
@@ -1032,22 +1237,43 @@ void CSphIndexSettings::Format ( SettingsFormatter_c & tOut, FilenameBuilder_i *
 	tOut.Add ( "stopword_step",			m_iStopwordStep,		m_iStopwordStep!=1 );
 	tOut.Add ( "overshort_step",		m_iOvershortStep,		m_iOvershortStep!=1 );
 	tOut.Add ( "bigram_index",			BigramName(m_eBigramIndex), m_eBigramIndex!=SPH_BIGRAM_NONE );
+	tOut.Add ( "bigram_delimiter",		BigramDelimiterName(m_eBigramDelimiter), m_eBigramDelimiter!=BigramDelimiter_e::DEFAULT );
 	tOut.Add ( "bigram_freq_words",		m_sBigramWords,			!m_sBigramWords.IsEmpty() );
 	tOut.Add ( "index_token_filter",	m_sIndexTokenFilter,	!m_sIndexTokenFilter.IsEmpty() );
 	tOut.Add ( "attr_update_reserve",	m_tBlobUpdateSpace,		m_tBlobUpdateSpace!=DEFAULT_ATTR_UPDATE_RESERVE );
+	tOut.Add ( "binlog",				0,						!m_bBinlog );
 
 	if ( m_eHitless==SPH_HITLESS_ALL )
 	{
 		tOut.Add ( "hitless_words",		"all",					true );
 	} else if ( m_eHitless==SPH_HITLESS_SOME )
 	{
-		CSphString sHitlessFiles = FormatPath ( m_sHitlessFiles, pFilenameBuilder );
-		tOut.Add ( "hitless_words",		sHitlessFiles,			true );
+		if ( tOut.m_eExt==ExtFilesFormat_e::FILE )
+		{
+			CSphString sHitlessFiles = FormatPath ( m_sHitlessFiles, pFilenameBuilder );
+			tOut.Add ( "hitless_words", sHitlessFiles, true );
+
+		} else
+		{
+			StringBuilder_c sHitlessContent ( "; " );
+			FormatFileContent ( m_sHitlessFiles, pFilenameBuilder, true, sHitlessContent );
+			tOut.Add ( "hitless_words_list", sHitlessContent.cstr(), true );
+		}
 	}
 
 	AddEngineSettings ( m_eEngine, tOut );
 	if ( m_eEngine==AttrEngine_e::DEFAULT && m_eDefaultEngine!=GetDefaultAttrEngine() )
 		AddEngineSettings ( m_eDefaultEngine, tOut );
+
+	if ( m_eJiebaMode==JiebaMode_e::FULL )
+		tOut.Add ( "jieba_mode",		"full",					true );
+	else if ( m_eJiebaMode==JiebaMode_e::SEARCH )
+		tOut.Add ( "jieba_mode",		"search",				true );
+
+	tOut.Add ( "jieba_hmm",				0,						!m_bJiebaHMM );
+
+	CSphString sJiebaDict = FormatPath ( m_sJiebaUserDictPath, pFilenameBuilder );
+	tOut.Add ( "jieba_user_dict_path",	sJiebaDict,				!sJiebaDict.IsEmpty() );
 
 	DocstoreSettings_t::Format ( tOut, pFilenameBuilder );
 }
@@ -1065,22 +1291,17 @@ void FileAccessSettings_t::Format ( SettingsFormatter_c & tOut, FilenameBuilder_
 	tOut.Add ( "access_hitlists",		FileAccessName(m_eHitlist),		m_eHitlist!=tDefault.m_eHitlist );
 	tOut.Add ( "access_plain_attrs",	FileAccessName(m_eAttr) ,		m_eAttr!=tDefault.m_eAttr );
 	tOut.Add ( "access_blob_attrs",		FileAccessName(m_eBlob) ,		m_eBlob!=tDefault.m_eBlob );
+	tOut.Add ( "access_dict",			FileAccessName(m_eDict) ,		m_eDict!=tDefault.m_eDict );
 }
 
 //////////////////////////////////////////////////////////////////////////
 
-static StrVec_t SplitArg ( const CSphString & sValue, StrVec_t & dFiles )
+static void SplitArg ( const CSphString & sValue, StrVec_t & dFiles )
 {
-	StrVec_t dValues = sphSplit ( sValue.cstr(), sValue.Length(), " \t," );
-	for ( auto & i : dValues )
-	{
-		dFiles.Add ( i.Trim() );
-		StripPath(i);
-	}
-
-	return dValues;
+	dFiles = sphSplit ( sValue.cstr(), sValue.Length(), " \t," );
+	for ( auto & sFile : dFiles )
+		sFile.Trim();
 }
-
 
 bool StrToAttrEngine ( AttrEngine_e & eEngine, AttrEngine_e eDefault, const CSphString & sValue, CSphString & sError )
 {
@@ -1104,8 +1325,78 @@ bool StrToAttrEngine ( AttrEngine_e & eEngine, AttrEngine_e eDefault, const CSph
 	return true;
 }
 
+struct ExtFiles_t
+{
+	StrVec_t	m_dFiles;
+	bool		m_bFilesSet = false;	// was this option set?
+	bool		m_bExtCopy = false;		// copy external files to table's folder?
+	CSphString	m_sListVals;			// values set from _list option
+};
 
-bool IndexSettingsContainer_c::AddOption ( const CSphString & sName, const CSphString & sValue )
+class IndexSettingsContainer_c : public IndexSettingsContainer_i
+{
+public:
+					IndexSettingsContainer_c() = default;
+					~IndexSettingsContainer_c() override;
+
+	bool			Populate ( const CreateTableSettings_t & tCreateTable, bool bExtCopy ) override;
+	bool			Add ( const char * szName, const CSphString & sValue ) override;
+	bool			Add ( const CSphString & sName, const CSphString & sValue ) override;
+	CSphString		Get ( const CSphString & sName ) const override;
+	CSphString		GetList ( const CSphString & sName ) const override;
+	bool			Contains ( const char * szName ) const override;
+	void			RemoveKeys ( const CSphString & sName ) override;
+	bool			AddOption ( const CSphString & sName, const CSphString & sValue, bool bExtCopy ) override;
+	bool			CheckPaths() override;
+	bool			CopyExternalFiles ( const CSphString & sIndexPath, int iSuffix ) override;
+	void			ResetCleanup() override;
+
+	const CSphConfigSection &	AsCfg() const override;
+	const CSphString &			GetError() const override { return m_sError; }
+
+private:
+	CSphConfigSection m_hCfg;
+
+	ExtFiles_t		m_tStopword;
+	ExtFiles_t		m_tException;
+	ExtFiles_t		m_tWordform;
+	ExtFiles_t		m_tHitless;
+	ExtFiles_t		m_tJiebaDict;
+	StrVec_t		m_dCleanupFiles;
+
+	CSphString		m_sError;
+	AttrEngine_e	m_eEngine = AttrEngine_e::DEFAULT;
+
+	void			SetupColumnarAttrs ( const CreateTableSettings_t & tCreateTable );
+	bool			SetupKNNAttrs ( const CreateTableSettings_t & tCreateTable );
+	void			SetupSIAttrs ( const CreateTableSettings_t & tCreateTable );
+
+	void			SetDefaults();
+
+	StrVec_t 		GetFiles();
+	bool			CopyExternalFiles ( const ExtFiles_t & tExt, const CSphString & sDestPath, const char * sKeyName, int iSuffix, int & iFile );
+	bool			CopyExternalFile ( const CSphString & sSrcFile, const CSphString & sDestPath, const char * sKeyName, int iSuffix, StringBuilder_c & sFilesOpt, int & iFile );
+	CSphString		GetExternalName ( const CSphString & sDestPath, const char * sKeyName, int iSuffix, int & iFile );
+	bool			CopyListFiles ( const ExtFiles_t & tExt, const CSphString & sDestPath, const char * sKeyName, int iSuffix, int & iFile, StringBuilder_c & sFilesOpt );
+};
+
+IndexSettingsContainer_i * CreateIndexSettingsContainer ()
+{
+	return new IndexSettingsContainer_c();
+}
+
+IndexSettingsContainer_c::~IndexSettingsContainer_c()
+{
+	for ( const auto & sFile : m_dCleanupFiles )
+		unlink ( sFile.cstr() );
+}
+
+void IndexSettingsContainer_c::ResetCleanup()
+{
+	m_dCleanupFiles.Reset();
+}
+
+bool IndexSettingsContainer_c::AddOption ( const CSphString & sName, const CSphString & sValue, bool bExtCopy )
 {
 	if ( sName=="type" && sValue=="pq" )
 	{
@@ -1115,74 +1406,142 @@ bool IndexSettingsContainer_c::AddOption ( const CSphString & sName, const CSphS
 
 	if ( sName=="stopwords" )
 	{
-		RemoveKeys(sName);
-		m_dStopwordFiles.Reset();
+		// new value replaces previous
+		m_tStopword.m_dFiles.Reset();
+		m_tStopword.m_bExtCopy = bExtCopy;
+		m_tStopword.m_bFilesSet = true;
 
-		StrVec_t dValues = SplitArg ( sValue, m_dStopwordFiles );
+		SplitArg ( sValue, m_tStopword.m_dFiles );
 
 		// m_dStopwordFiles now holds the files with olds paths
 		// there's a hack in stopword loading code that modifies the folder to pre-installed
 		// let's use this hack here and copy that file too so that we're fully standalone
-		for ( auto & i : m_dStopwordFiles )
-			if ( !sphIsReadable(i) )
+		for ( auto & sFile : m_tStopword.m_dFiles )
+		{
+			if ( !sphIsReadable ( sFile ) )
 			{
-				CSphString sFilename = i;
-				sFilename.SetSprintf ( "%s/stopwords/%s", GET_FULL_SHARE_DIR (), StripPath(sFilename).cstr() );
+				CSphString sFilename;
+				sFilename.SetSprintf ( "%s/stopwords/%s", GET_FULL_SHARE_DIR (), StripPath ( sFile ).cstr() );
 				if ( sphIsReadable ( sFilename.cstr() ) )
-					i = sFilename;
+				{
+					sFile = sFilename;
+				} else
+				{
+					m_sError.SetSprintf ( "'stopwords' file missed %s", sFile.cstr() );
+					return false;
+				}
 			}
+		}
 
-		StringBuilder_c sNewValue {" "};
-		for ( auto & i : dValues )
-			sNewValue << i;
+		// will add string option after copy
+		return true;
+	}
 
-		return Add ( sName, sNewValue.cstr() );
+	if ( sName=="stopwords_list" )
+	{
+		m_tStopword.m_dFiles.Reset();
+		m_tStopword.m_bExtCopy = bExtCopy;
+		m_tStopword.m_bFilesSet = true;
+		m_tStopword.m_sListVals = sValue;
+		return true;
 	}
 
 	if ( sName=="exceptions" )
 	{
-		RemoveKeys(sName);
-		m_dExceptionFiles.Reset();
+		// new value replaces previous
+		m_tException.m_dFiles.Reset();
+		m_tException.m_bExtCopy = bExtCopy;
+		m_tException.m_bFilesSet = true;
 
-		StrVec_t dValues = SplitArg ( sValue, m_dExceptionFiles );
-		if ( dValues.GetLength()>1 )
+		SplitArg ( sValue, m_tException.m_dFiles );
+
+		if ( m_tException.m_dFiles.GetLength()>1 )
 		{
 			m_sError = "'exceptions' options only supports a single file";
 			return false;
-		} else if ( dValues.IsEmpty() )
+		} else if ( m_tException.m_dFiles.IsEmpty() )
 		{
 			// needs an empty value
-			dValues.Add ();
+			m_tException.m_dFiles.Add();
 		}
 
-		return Add ( sName, dValues[0] );
+		// will add string option after copy
+		return true;
+	}
+
+	if ( sName=="exceptions_list" )
+	{
+		m_tException.m_dFiles.Reset();
+		m_tException.m_bExtCopy = bExtCopy;
+		m_tException.m_bFilesSet = true;
+		m_tException.m_sListVals = sValue;
+		return true;
 	}
 
 	if ( sName=="wordforms" )
 	{
-		RemoveKeys(sName);
-		m_dWordformFiles.Reset();
+		// multiple wordworms are ok - no need to reset
+		m_tWordform.m_bExtCopy = bExtCopy;
+		m_tWordform.m_bFilesSet = true;
 
-		StrVec_t dValues = SplitArg ( sValue, m_dWordformFiles );
-		for ( auto & i : dValues )
-			Add ( sName, i );
+		// will add string option after copy
+		SplitArg ( sValue, m_tWordform.m_dFiles );
 
+		return true;
+	}
+
+	if ( sName=="wordforms_list" )
+	{
+		m_tWordform.m_bExtCopy = bExtCopy;
+		m_tWordform.m_bFilesSet = true;
+		m_tWordform.m_sListVals = sValue;
 		return true;
 	}
 
 	if ( sName=="hitless_words" && ( sValue!="none" && sValue!="all" ) )
 	{
-		RemoveKeys ( sName );
-		m_dHitlessFiles.Reset();
-		StrVec_t dValues = SplitArg ( sValue, m_dHitlessFiles );
+		// new value replaces previous
+		m_tHitless.m_dFiles.Reset();
+		m_tHitless.m_bExtCopy = bExtCopy;
+		m_tHitless.m_bFilesSet = true;
 
-		// need only names for hitless files
-		StringBuilder_c sTmp ( " " );
-		for ( const CSphString & sVal : dValues )
-			sTmp << sVal;
+		SplitArg ( sValue, m_tHitless.m_dFiles );
 
-		return Add ( sName, sTmp.cstr() );
+		// will add string option after copy
+		return true;
+	}
 
+	if ( sName=="hitless_words_list" )
+	{
+		m_tHitless.m_dFiles.Reset();
+		m_tHitless.m_bExtCopy = bExtCopy;
+		m_tHitless.m_bFilesSet = true;
+		m_tHitless.m_sListVals = sValue;
+		return true;
+	}
+
+	if ( sName=="jieba_user_dict_path" )
+	{
+		// new value replaces previous
+		m_tJiebaDict.m_dFiles.Reset();
+		m_tJiebaDict.m_bExtCopy = bExtCopy;
+		m_tJiebaDict.m_bFilesSet = true;
+
+		SplitArg ( sValue, m_tJiebaDict.m_dFiles );
+
+		if ( m_tJiebaDict.m_dFiles.GetLength()>1 )
+		{
+			m_sError = "'jieba_user_dict_path' options only supports a single file";
+			return false;
+		}
+		else if ( m_tJiebaDict.m_dFiles.IsEmpty() )
+		{
+			// needs an empty value
+			m_tJiebaDict.m_dFiles.Add();
+		}
+
+		// will add string option after copy
+		return true;
 	}
 
 	if ( sName=="engine" )
@@ -1243,7 +1602,46 @@ void IndexSettingsContainer_c::SetupColumnarAttrs ( const CreateTableSettings_t 
 }
 
 
-bool IndexSettingsContainer_c::Populate ( const CreateTableSettings_t & tCreateTable )
+bool IndexSettingsContainer_c::SetupKNNAttrs ( const CreateTableSettings_t & tCreateTable )
+{
+	StringBuilder_c sColumnarAttrs(",");
+
+	CSphVector<NamedKNNSettings_t> dKNNAttrs;
+	for ( const auto & i : tCreateTable.m_dAttrs )
+		if ( i.m_bKNN )
+		{
+			NamedKNNSettings_t & tNamedKNN = dKNNAttrs.Add();
+			(knn::IndexSettings_t&)tNamedKNN = i.m_tKNN;
+			(knn::ModelSettings_t&)tNamedKNN = i.m_tKNNModel;
+			tNamedKNN.m_sName = i.m_tAttr.m_sName;
+			tNamedKNN.m_sFrom = i.m_sKNNFrom;
+
+			if ( !ValidateSettingModel ( i, m_sError ) )
+				return false;
+		}
+
+	if ( !dKNNAttrs.GetLength() )
+		return true;
+
+	Add ( "knn", FormatKNNConfigStr(dKNNAttrs).cstr() );
+	return true;
+}
+
+
+void IndexSettingsContainer_c::SetupSIAttrs ( const CreateTableSettings_t & tCreateTable )
+{
+	StringBuilder_c sJsonSIAttrs(",");
+
+	for ( const auto & i : tCreateTable.m_dAttrs )
+		if ( i.m_bIndexed )
+			sJsonSIAttrs << i.m_tAttr.m_sName;
+
+	if ( sJsonSIAttrs.GetLength() )
+		Add ( "json_secondary_indexes", sJsonSIAttrs.cstr() );
+}
+
+
+bool IndexSettingsContainer_c::Populate ( const CreateTableSettings_t & tCreateTable, bool bExtCopy )
 {
 	StringBuilder_c sStoredFields(",");
 	StringBuilder_c sStoredOnlyFields(",");
@@ -1285,15 +1683,19 @@ bool IndexSettingsContainer_c::Populate ( const CreateTableSettings_t & tCreateT
 		}
 
 	for ( const auto & i : tCreateTable.m_dOpts )
-		if ( !AddOption ( i.m_sName, i.m_sValue ) )
+		if ( !AddOption ( i.m_sName, i.m_sValue, bExtCopy ) )
 			return false;
 
 	SetupColumnarAttrs(tCreateTable);
+	if ( !SetupKNNAttrs(tCreateTable) )
+		return false;
+
+	SetupSIAttrs(tCreateTable);
 
 	if ( !Contains("type") )
 		Add ( "type", "rt" );
 
-	if ( !Contains("engine_default") && GetDefaultAttrEngine()==AttrEngine_e::COLUMNAR )	
+	if ( !Contains("engine_default") && GetDefaultAttrEngine()==AttrEngine_e::COLUMNAR )
 		Add ( "engine_default", "columnar" );
 
 	bool bDistributed = Get("type")=="distributed";
@@ -1302,10 +1704,7 @@ bool IndexSettingsContainer_c::Populate ( const CreateTableSettings_t & tCreateT
 
 	SetDefaults();
 
-	if ( !CheckPaths() )
-		return false;
-
-	return true;
+	return CheckPaths();
 }
 
 
@@ -1331,6 +1730,22 @@ CSphString IndexSettingsContainer_c::Get ( const CSphString & sName ) const
 	return m_hCfg[sName].strval();
 }
 
+CSphString IndexSettingsContainer_c::GetList ( const CSphString & sName ) const
+{
+	if ( !Contains ( sName.cstr() ) )
+		return "";
+
+	CSphVariant * pVal = m_hCfg ( sName.cstr() );
+	if ( !pVal || !pVal->m_pNext )
+		return m_hCfg[sName].strval();
+
+	StringBuilder_c sList ( " " );
+	for ( ; pVal; pVal = pVal->m_pNext )
+		sList << pVal->cstr();
+
+	return (CSphString)sList;
+}
+
 
 bool IndexSettingsContainer_c::Contains ( const char * szName ) const
 {
@@ -1338,24 +1753,34 @@ bool IndexSettingsContainer_c::Contains ( const char * szName ) const
 }
 
 
-StrVec_t IndexSettingsContainer_c::GetFiles() const
+StrVec_t IndexSettingsContainer_c::GetFiles()
 {
 	StrVec_t dFiles;
-	for ( const auto & i : m_dStopwordFiles )
-		dFiles.Add(i);
+	for ( const auto & i : m_tStopword.m_dFiles )
+		dFiles.Add ( i );
 
-	for ( const auto & i : m_dExceptionFiles )
-		dFiles.Add(i);
+	for ( const auto & i : m_tException.m_dFiles )
+		dFiles.Add ( i );
 
-	for ( const auto & i : m_dWordformFiles )
+	for ( const auto & i : m_tWordform.m_dFiles )
 	{
 		StrVec_t dFilesFound = FindFiles ( i.cstr() );
 		for ( const auto & j : dFilesFound )
 			dFiles.Add(j);
+
+		// missed wordforms for file without wildcard should fail create table
+		if ( dFilesFound.IsEmpty() && !HasWildcards ( i.cstr() ) )
+		{
+			m_sError.SetSprintf ( "file not found: '%s'", i.cstr() );
+			return StrVec_t();
+		}
 	}
 
-	for ( const auto & i : m_dHitlessFiles )
-		dFiles.Add ( i );
+	for ( const auto & i : m_tHitless.m_dFiles )
+		dFiles.Add(i);
+
+	for ( const auto & i : m_tJiebaDict.m_dFiles )
+		dFiles.Add(i);
 
 	return dFiles;
 }
@@ -1369,7 +1794,7 @@ const CSphConfigSection & IndexSettingsContainer_c::AsCfg() const
 // TODO: read defaults from file or predefined templates
 static std::pair<const char* , const char *> g_dIndexSettingsDefaults[] =
 {
-	{ "charset_table", "non_cjk" }
+	{ "charset_table", "non_cont" }
 };
 
 void IndexSettingsContainer_c::SetDefaults()
@@ -1385,8 +1810,20 @@ void IndexSettingsContainer_c::SetDefaults()
 bool IndexSettingsContainer_c::CheckPaths()
 {
 	StrVec_t dFiles = GetFiles();
+	if ( !m_sError.IsEmpty() )
+		return false;
+
 	for ( const auto & i : dFiles )
 	{
+		if ( i.IsEmpty() )
+			continue;
+
+		if ( HasWildcard ( i.cstr() ) && FindFiles ( i.cstr(), false ).IsEmpty() )
+		{
+			m_sError.SetSprintf ( "fileы not found: '%s'", i.cstr() );
+			return false;
+		}
+
 		if ( !sphIsReadable(i) )
 		{
 			m_sError.SetSprintf ( "file not found: '%s'", i.cstr() );
@@ -1399,6 +1836,108 @@ bool IndexSettingsContainer_c::CheckPaths()
 			return false;
 		}
 	}
+
+	return true;
+}
+
+bool IndexSettingsContainer_c::CopyExternalFiles ( const CSphString & sIndexPath, int iSuffix )
+{
+	int iFile = 0;
+	if ( !CopyExternalFiles ( m_tStopword, sIndexPath, "stopwords", iSuffix, iFile ) )
+		return false;
+
+	iFile = 0;
+	if ( !CopyExternalFiles ( m_tException, sIndexPath, "exceptions", iSuffix, iFile ) )
+		return false;
+
+	iFile = 0;
+	if ( !CopyExternalFiles ( m_tHitless, sIndexPath, "hitless_words", iSuffix, iFile ) )
+		return false;
+
+	iFile = 0;
+	if ( !CopyExternalFiles ( m_tJiebaDict, sIndexPath, "jieba_user_dict_path", iSuffix, iFile ) )
+		return false;
+
+	if ( m_tWordform.m_bFilesSet )
+	{
+		if ( !m_tWordform.m_sListVals.IsEmpty() )
+			return CopyExternalFiles ( m_tWordform, sIndexPath, "wordforms", iSuffix, iFile );
+
+		int iFile = 0;
+		ExtFiles_t tFiles;
+		tFiles.m_bFilesSet = true;
+		tFiles.m_bExtCopy = m_tWordform.m_bExtCopy;
+		for ( const auto & sWordformFiles : m_tWordform.m_dFiles )
+		{
+			StrVec_t dFiles = FindFiles ( sWordformFiles.cstr() );
+			for ( const auto & sSingleFile : dFiles )
+			{
+				tFiles.m_dFiles.Reset();
+				tFiles.m_dFiles.Add ( sSingleFile );
+				if ( !CopyExternalFiles ( tFiles, sIndexPath, "wordforms", iSuffix, iFile ) )
+					return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+CSphString IndexSettingsContainer_c::GetExternalName ( const CSphString & sDestPath, const char * sKeyName, int iSuffix, int & iFile )
+{
+	CSphString sDstFile;
+	do
+	{
+		sDstFile.SetSprintf ( "%s/%s_chunk%d_%d.txt", sDestPath.cstr(), sKeyName, iSuffix, iFile );
+		iFile++;
+
+	} while ( sphIsReadable ( sDstFile.cstr() ) );
+
+	return sDstFile;
+}
+
+bool IndexSettingsContainer_c::CopyExternalFile ( const CSphString & sSrcFile, const CSphString & sDestPath, const char * sKeyName, int iSuffix, StringBuilder_c & sFilesOpt, int & iFile )
+{
+	CSphString sDstFile = GetExternalName ( sDestPath, sKeyName, iSuffix, iFile );
+	if ( !CopyFile ( sSrcFile, sDstFile, m_sError ) )
+		return false;
+
+	m_dCleanupFiles.Add ( sDstFile );
+	sFilesOpt << StripPath ( sDstFile ).cstr();
+	return true;
+}
+
+bool IndexSettingsContainer_c::CopyExternalFiles ( const ExtFiles_t & tExt, const CSphString & sDestPath, const char * sKeyName, int iSuffix, int & iFile )
+{
+	if ( !tExt.m_bFilesSet )
+		return true;
+
+	StringBuilder_c sFilesOpt ( " "  );
+
+	if ( !tExt.m_sListVals.IsEmpty() )
+	{
+		if ( !CopyListFiles ( tExt, sDestPath, sKeyName, iSuffix, iFile, sFilesOpt ) )
+			return false;
+
+	} else if ( tExt.m_bExtCopy )
+	{
+		for ( const auto & sSrcFile : tExt.m_dFiles )
+		{
+			if ( sSrcFile.IsEmpty() )
+				continue;
+			if ( !CopyExternalFile ( sSrcFile, sDestPath, sKeyName, iSuffix, sFilesOpt, iFile ) )
+				return false;
+		}
+	} else
+	{
+		for ( const auto & sSrcFile : tExt.m_dFiles )
+		{
+			CSphString sDstFile = sSrcFile;
+			sFilesOpt << StripPath ( sDstFile ).cstr();
+		}
+	}
+
+	Add ( sKeyName, sFilesOpt.cstr() );
 
 	return true;
 }
@@ -1621,6 +2160,8 @@ static void FormatAllSettings ( const CSphIndex & tIndex, SettingsFormatter_c & 
 		pDict->GetSettings().Format ( tFormatter, pFilenameBuilder );
 
 	tIndex.GetMutableSettings().Format ( tFormatter, pFilenameBuilder );
+	if ( tIndex.m_iTID==-1 )
+		tFormatter.Add ( "binlog", "0", true );
 }
 
 
@@ -1669,10 +2210,11 @@ void DumpSettingsCfg ( FILE * fp, const CSphIndex & tIndex, FilenameBuilder_i * 
 }
 
 
-static void DumpCreateTable ( StringBuilder_c & tBuf, const CSphIndex & tIndex, FilenameBuilder_i * pFilenameBuilder )
+static void DumpCreateTable ( StringBuilder_c & tBuf, const CSphIndex & tIndex, FilenameBuilder_i * pFilenameBuilder, ExtFilesFormat_e eExt )
 {
 	SettingsFormatterState_t tState(tBuf);
-	SettingsFormatter_c tFormatter ( tState, "", "='", "'", " " );
+	// all ext files should be in the _list format by default
+	SettingsFormatter_c tFormatter ( tState, "", "='", "'", " ", false, true, eExt );
 	FormatAllSettings ( tIndex, tFormatter, pFilenameBuilder );
 }
 
@@ -1740,6 +2282,7 @@ bool sphFixupIndexSettings ( CSphIndex * pIndex, const CSphConfigSection & hInde
 
 		CSphString sWarning;
 		sphSpawnFilterICU ( pFieldFilter, pIndex->GetSettings(), pIndex->GetTokenizer()->GetSettings(), pIndex->GetName(), sWarning );
+		SpawnFilterJieba ( pFieldFilter, pIndex->GetSettings(), pIndex->GetTokenizer()->GetSettings(), pIndex->GetName(), pFilenameBuilder, sWarning );
 		AddWarning ( dWarnings, sWarning );
 
 		pIndex->SetFieldFilter ( std::move ( pFieldFilter ) );
@@ -1759,8 +2302,7 @@ bool sphFixupIndexSettings ( CSphIndex * pIndex, const CSphConfigSection & hInde
 		dWarnings.Add ( "no morphology, index_exact_words=1 has no effect, ignoring" );
 	}
 
-	if ( pDict->GetSettings().m_bWordDict && pDict->HasMorphology() &&
-		( tSettings.RawMinPrefixLen() || tSettings.m_iMinInfixLen || !pDict->GetSettings().m_sMorphFields.IsEmpty() ) && !tSettings.m_bIndexExactWords )
+	if ( !tSettings.m_bIndexExactWords && ForceExactWords ( pDict->GetSettings().m_bWordDict, pDict->HasMorphology(), tSettings.RawMinPrefixLen(), tSettings.m_iMinInfixLen, pDict->GetSettings().m_sMorphFields.IsEmpty() ) )
 	{
 		tSettings.m_bIndexExactWords = true;
 		pIndex->Setup ( tSettings );
@@ -1771,6 +2313,10 @@ bool sphFixupIndexSettings ( CSphIndex * pIndex, const CSphConfigSection & hInde
 	return true;
 }
 
+bool ForceExactWords ( bool bWordDict, bool bHasMorphology, int iMinPrefixLen, int iMinInfixLen, bool bMorphFieldsEmpty )
+{
+	return ( bWordDict && bHasMorphology && ( iMinPrefixLen || iMinInfixLen || !bMorphFieldsEmpty ) );
+}
 
 static RtTypedAttr_t g_dTypeNames[] =
 {
@@ -1783,7 +2329,9 @@ static RtTypedAttr_t g_dTypeNames[] =
 	{ SPH_ATTR_JSON,		"json" },
 	{ SPH_ATTR_STRING,		"string" },
 	{ SPH_ATTR_STRINGPTR,	"string" },
-	{ SPH_ATTR_TIMESTAMP,	"timestamp" }
+	{ SPH_ATTR_TDIGEST_PTR,	"tdigest" },
+	{ SPH_ATTR_TIMESTAMP,	"timestamp" },
+	{ SPH_ATTR_FLOAT_VECTOR, "float_vector" }
 };
 
 
@@ -1827,7 +2375,7 @@ static void AddStorageSettings ( StringBuilder_c & sRes, const CSphColumnInfo & 
 	bool bColumnar = CombineEngines ( tIndex.GetSettings().m_eEngine, tAttr.m_eEngine )==AttrEngine_e::COLUMNAR;
 	if ( bColumnar )
 	{
-		if ( tAttr.m_eAttrType!=SPH_ATTR_JSON && !(tAttr.m_uAttrFlags & CSphColumnInfo::ATTR_STORED) && iNumColumnar>1 )
+		if ( tAttr.m_eAttrType!=SPH_ATTR_JSON && !tAttr.IsStored() && iNumColumnar>1 )
 			sRes << " fast_fetch='0'";
 
 		if ( tAttr.m_eAttrType==SPH_ATTR_STRING && !(tAttr.m_uAttrFlags & CSphColumnInfo::ATTR_COLUMNAR_HASHES) )
@@ -1845,9 +2393,16 @@ static void AddEngineSettings ( StringBuilder_c & sRes, const CSphColumnInfo & t
 }
 
 
+static void AddSISettings ( StringBuilder_c & sRes, const CSphColumnInfo & tAttr )
+{
+	if ( tAttr.IsIndexedSI() )
+		sRes << " secondary_index='1'";
+}
+
+
 static bool IsDDLToken ( const CSphString & sTok )
 {
-	static const CSphString dTokens[] = 
+	static const CSphString dTokens[] =
 	{
 		"ADD",
 		"ALTER",
@@ -1866,15 +2421,16 @@ static bool IsDDLToken ( const CSphString & sTok )
 		"ENGINE",
 		"EXISTS",
 		"FAST_FETCH",
-		"FLOAT", 
-		"FROM", 
+		"FLOAT",
+		"FROM",
 		"FUNCTION",
-		"HASH", 
-		"IMPORT", 
+		"HASH",
+		"IMPORT",
 		"INDEXED",
 		"INTEGER",
 		"INT",
 		"IF",
+		"KNN",
 		"JOIN",
 		"JSON",
 		"KILLLIST_TARGET",
@@ -1920,6 +2476,8 @@ static CSphString FormatCreateTableAttr ( const CSphColumnInfo & tAttr, const CS
 
 	AddStorageSettings ( sRes, tAttr, *pIndex, false, iNumColumnar );
 	AddEngineSettings ( sRes, tAttr );
+	AddKNNSettings ( sRes, tAttr );
+	AddSISettings ( sRes, tAttr );
 
 	return sRes.cstr();
 }
@@ -1954,7 +2512,7 @@ static CSphString FormatCreateTableField ( const CSphColumnInfo & tField, const 
 }
 
 
-CSphString BuildCreateTable ( const CSphString & sName, const CSphIndex * pIndex, const CSphSchema & tSchema )
+CSphString BuildCreateTable ( const CSphString & sName, const CSphIndex * pIndex, const CSphSchema & tSchema, ExtFilesFormat_e eExt )
 {
 	assert ( pIndex );
 
@@ -1978,7 +2536,7 @@ CSphString BuildCreateTable ( const CSphString & sName, const CSphIndex * pIndex
 			dExcludeAttrs.Add(&tAttr);
 	}
 
-	dExcludeAttrs.Uniq();
+	dExcludeAttrs.Uniq(sph::unstable);
 
 	const CSphColumnInfo * pId = tSchema.GetAttr("id");
 	assert(pId);
@@ -2012,7 +2570,7 @@ CSphString BuildCreateTable ( const CSphString & sName, const CSphIndex * pIndex
 	if ( g_fnCreateFilenameBuilder )
 		pFilenameBuilder = g_fnCreateFilenameBuilder ( pIndex->GetName() );
 
-	DumpCreateTable ( tBuf, *pIndex, pFilenameBuilder.get() );
+	DumpCreateTable ( tBuf, *pIndex, pFilenameBuilder.get(), eExt );
 
 	if ( tBuf.GetLength() )
 		sRes << " " << tBuf.cstr();
@@ -2088,7 +2646,7 @@ int ParseKeywordExpansion ( const char * sValue )
 
 const char * GetMutableName ( MutableName_e eName )
 {
-	switch ( eName ) 
+	switch ( eName )
 	{
 		case MutableName_e::EXPAND_KEYWORDS: return "expand_keywords";
 		case MutableName_e::RT_MEM_LIMIT: return "rt_mem_limit";
@@ -2097,9 +2655,13 @@ const char * GetMutableName ( MutableName_e eName )
 		case MutableName_e::ACCESS_BLOB_ATTRS: return "access_blob_attrs";
 		case MutableName_e::ACCESS_DOCLISTS: return "access_doclists";
 		case MutableName_e::ACCESS_HITLISTS: return "access_hitlists";
+		case MutableName_e::ACCESS_DICT: return "access_dict";
 		case MutableName_e::READ_BUFFER_DOCS: return "read_buffer_docs";
 		case MutableName_e::READ_BUFFER_HITS: return "read_buffer_hits";
 		case MutableName_e::OPTIMIZE_CUTOFF: return "optimize_cutoff";
+		case MutableName_e::GLOBAL_IDF: return "global_idf";
+		case MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT: return "diskchunk_flush_write_timeout";
+		case MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT: return "diskchunk_flush_search_timeout";
 		default: assert ( 0 && "Invalid mutable option" ); return "";
 	}
 }
@@ -2172,6 +2734,9 @@ MutableIndexSettings_c::MutableIndexSettings_c()
 	: m_iExpandKeywords { KWE_DISABLED }
 	, m_iMemLimit { DEFAULT_RT_MEM_LIMIT }
 	, m_iOptimizeCutoff ( g_iOptimizeCutoff )
+	, m_iOptimizeCutoffKNN ( g_iOptimizeCutoff )
+	, m_iFlushWrite ( -1 )
+	, m_iFlushSearch ( -1 )
 	, m_dLoaded ( (int)MutableName_e::TOTAL )
 {
 #if !_WIN32
@@ -2227,77 +2792,78 @@ bool MutableIndexSettings_c::Load ( const char * sFileName, const char * sIndexN
 
 	// read values
 
-	JsonObj_c tExpand = tParser.GetStrItem ( "expand_keywords", sError, true );
+	JsonObj_c tExpand = tParser.GetStrItem ( GetMutableName ( MutableName_e::EXPAND_KEYWORDS ), sError, true );
 	if ( tExpand )
 	{
 		m_iExpandKeywords = ParseKeywordExpansion ( tExpand.StrVal().cstr() );
 		m_dLoaded.BitSet ( (int)MutableName_e::EXPAND_KEYWORDS );
-	} else if ( !sError.IsEmpty() )
-	{
-		sphWarning ( "table %s: %s", sIndexName, sError.cstr() );
-		sError = "";
 	}
 
-	JsonObj_c tMemLimit = tParser.GetIntItem ( "rt_mem_limit", sError, true );
+	JsonObj_c tMemLimit = tParser.GetIntItem ( GetMutableName ( MutableName_e::RT_MEM_LIMIT ), sError, true );
 	if ( tMemLimit )
 	{
 		m_iMemLimit = GetMemLimit ( tMemLimit.IntVal(), nullptr );
 		m_dLoaded.BitSet ( (int)MutableName_e::RT_MEM_LIMIT );
-	} else if ( !sError.IsEmpty() )
-	{
-		sphWarning ( "table %s: %s", sIndexName, sError.cstr() );
-		sError = "";
 	}
 
-	JsonObj_c tPreopen = tParser.GetBoolItem ( "preopen", sError, true );
+	JsonObj_c tPreopen = tParser.GetBoolItem ( GetMutableName ( MutableName_e::PREOPEN ), sError, true );
 	if ( tPreopen )
 	{
 		m_bPreopen = tPreopen.BoolVal() || MutableIndexSettings_c::GetDefaults().m_bPreopen;
 		m_dLoaded.BitSet ( (int)MutableName_e::PREOPEN );
-	} else if ( !sError.IsEmpty() )
-	{
-		sphWarning ( "table %s: %s", sIndexName, sError.cstr() );
-		sError = "";
 	}
 
 	GetFileAccess( tParser, MutableName_e::ACCESS_PLAIN_ATTRS, false, m_tFileAccess.m_eAttr, m_dLoaded );
 	GetFileAccess( tParser, MutableName_e::ACCESS_BLOB_ATTRS, false, m_tFileAccess.m_eBlob, m_dLoaded );
 	GetFileAccess( tParser, MutableName_e::ACCESS_DOCLISTS, true, m_tFileAccess.m_eDoclist, m_dLoaded );
 	GetFileAccess( tParser, MutableName_e::ACCESS_HITLISTS, true, m_tFileAccess.m_eHitlist, m_dLoaded );
+	GetFileAccess( tParser, MutableName_e::ACCESS_DICT, false, m_tFileAccess.m_eDict, m_dLoaded );
 
-	JsonObj_c tReadBuffer = tParser.GetIntItem ( "read_buffer_docs", sError, true );
+	JsonObj_c tReadBuffer = tParser.GetIntItem ( GetMutableName ( MutableName_e::READ_BUFFER_DOCS ), sError, true );
 	if ( tReadBuffer )
 	{
 		m_tFileAccess.m_iReadBufferDocList = GetReadBuffer ( tReadBuffer.IntVal() );
 		m_dLoaded.BitSet ( (int)MutableName_e::READ_BUFFER_DOCS );
-	} else if ( !sError.IsEmpty() )
-	{
-		sphWarning ( "table %s: %s", sIndexName, sError.cstr() );
-		sError = "";
 	}
 
-	tReadBuffer = tParser.GetIntItem ( "read_buffer_hits", sError, true );
+	tReadBuffer = tParser.GetIntItem ( GetMutableName ( MutableName_e::READ_BUFFER_HITS ), sError, true );
 	if ( tReadBuffer )
 	{
 		m_tFileAccess.m_iReadBufferHitList = GetReadBuffer ( tReadBuffer.IntVal() );
 		m_dLoaded.BitSet ( (int)MutableName_e::READ_BUFFER_HITS );
-	} else if ( !sError.IsEmpty() )
-	{
-		sphWarning ( "table %s: %s", sIndexName, sError.cstr() );
-		sError = "";
 	}
 
-	JsonObj_c tOptimizeCutoff = tParser.GetIntItem ( "optimize_cutoff", sError, true );
+	JsonObj_c tOptimizeCutoff = tParser.GetIntItem ( GetMutableName ( MutableName_e::OPTIMIZE_CUTOFF ), sError, true );
 	if ( tOptimizeCutoff )
 	{
 		m_iOptimizeCutoff = tOptimizeCutoff.IntVal();
 		m_iOptimizeCutoff = Max ( m_iOptimizeCutoff, 1 );
 		m_dLoaded.BitSet ( (int)MutableName_e::OPTIMIZE_CUTOFF );
-	} else if ( !sError.IsEmpty() )
-	{
-		sphWarning ( "table %s: %s", sIndexName, sError.cstr() );
-		sError = "";
 	}
+
+	JsonObj_c tGlobalIdf = tParser.GetStrItem ( GetMutableName ( MutableName_e::GLOBAL_IDF ), sError, true );
+	if ( tGlobalIdf )
+	{
+		m_sGlobalIDFPath = tGlobalIdf.StrVal();
+		m_dLoaded.BitSet ( (int)MutableName_e::GLOBAL_IDF );
+	}
+
+	JsonObj_c tFlushWrite = tParser.GetIntItem ( GetMutableName ( MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT ), sError, true );
+	if ( tFlushWrite )
+	{
+		m_iFlushWrite = tFlushWrite.IntVal();
+		m_dLoaded.BitSet ( (int)MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT );
+	}
+
+	JsonObj_c tFlushSearch = tParser.GetIntItem ( GetMutableName ( MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT ), sError, true );
+	if ( tFlushSearch )
+	{
+		m_iFlushSearch = tFlushSearch.IntVal();
+		m_dLoaded.BitSet ( (int)MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT );
+	}
+
+	if ( !sError.IsEmpty() )
+		sphWarning ( "table %s: %s", sIndexName, sError.cstr() );
 
 	m_bNeedSave = true;
 
@@ -2308,22 +2874,22 @@ void MutableIndexSettings_c::Load ( const CSphConfigSection & hIndex, bool bNeed
 {
 	m_bNeedSave |= bNeedSave;
 
-	if ( hIndex.Exists ( "expand_keywords" ) )
+	if ( hIndex.Exists ( GetMutableName ( MutableName_e::EXPAND_KEYWORDS ) ) )
 	{
-		m_iExpandKeywords = ParseKeywordExpansion ( hIndex.GetStr( "expand_keywords" ).cstr() );
+		m_iExpandKeywords = ParseKeywordExpansion ( hIndex.GetStr( GetMutableName ( MutableName_e::EXPAND_KEYWORDS ) ).cstr() );
 		m_dLoaded.BitSet ( (int)MutableName_e::EXPAND_KEYWORDS );
 	}
 
 	// RAM chunk size
-	if ( hIndex.Exists ( "rt_mem_limit" ) )
+	if ( hIndex.Exists ( GetMutableName ( MutableName_e::RT_MEM_LIMIT ) ) )
 	{
-		m_iMemLimit = GetMemLimit ( hIndex.GetSize64 ( "rt_mem_limit", DEFAULT_RT_MEM_LIMIT ), pWarnings );
+		m_iMemLimit = GetMemLimit ( hIndex.GetSize64 ( GetMutableName ( MutableName_e::RT_MEM_LIMIT ), DEFAULT_RT_MEM_LIMIT ), pWarnings );
 		m_dLoaded.BitSet ( (int)MutableName_e::RT_MEM_LIMIT );
 	}
 
-	if (  hIndex.Exists ( "preopen" )  )
+	if (  hIndex.Exists ( GetMutableName ( MutableName_e::PREOPEN ) )  )
 	{
-		m_bPreopen = hIndex.GetBool ( "preopen", false ) || MutableIndexSettings_c::GetDefaults().m_bPreopen;
+		m_bPreopen = hIndex.GetBool ( GetMutableName ( MutableName_e::PREOPEN ), false ) || MutableIndexSettings_c::GetDefaults().m_bPreopen;
 		m_dLoaded.BitSet ( (int)MutableName_e::PREOPEN );
 	}
 
@@ -2357,25 +2923,45 @@ void MutableIndexSettings_c::Load ( const CSphConfigSection & hIndex, bool bNeed
 	GetFileAccess( hIndex, MutableName_e::ACCESS_BLOB_ATTRS, false, m_tFileAccess.m_eBlob, m_dLoaded );
 	GetFileAccess( hIndex, MutableName_e::ACCESS_DOCLISTS, true, m_tFileAccess.m_eDoclist, m_dLoaded );
 	GetFileAccess( hIndex, MutableName_e::ACCESS_HITLISTS, true, m_tFileAccess.m_eHitlist, m_dLoaded );
+	GetFileAccess( hIndex, MutableName_e::ACCESS_DICT, false, m_tFileAccess.m_eDict, m_dLoaded );
 
-	if ( hIndex.Exists ( "read_buffer_docs" ) )
+	if ( hIndex.Exists ( GetMutableName ( MutableName_e::READ_BUFFER_DOCS ) ) )
 	{
-		m_tFileAccess.m_iReadBufferDocList = GetReadBuffer ( hIndex.GetSize ( "read_buffer_docs", m_tFileAccess.m_iReadBufferDocList ) );
+		m_tFileAccess.m_iReadBufferDocList = GetReadBuffer ( hIndex.GetSize ( GetMutableName ( MutableName_e::READ_BUFFER_DOCS ), m_tFileAccess.m_iReadBufferDocList ) );
 		m_dLoaded.BitSet ( (int)MutableName_e::READ_BUFFER_DOCS );
 	}
 
-	if ( hIndex.Exists ( "read_buffer_hits" ) )
+	if ( hIndex.Exists ( GetMutableName ( MutableName_e::READ_BUFFER_HITS ) ) )
 	{
-		m_tFileAccess.m_iReadBufferHitList = GetReadBuffer ( hIndex.GetSize ( "read_buffer_hits", m_tFileAccess.m_iReadBufferHitList ) );
+		m_tFileAccess.m_iReadBufferHitList = GetReadBuffer ( hIndex.GetSize ( GetMutableName ( MutableName_e::READ_BUFFER_HITS ), m_tFileAccess.m_iReadBufferHitList ) );
 		m_dLoaded.BitSet ( (int)MutableName_e::READ_BUFFER_HITS );
 	}
 
-	if ( hIndex.Exists ( "optimize_cutoff" ) )
+	if ( hIndex.Exists ( GetMutableName ( MutableName_e::OPTIMIZE_CUTOFF ) ) )
 	{
-		m_iOptimizeCutoff = hIndex.GetInt ( "optimize_cutoff", g_iOptimizeCutoff );
+		m_iOptimizeCutoff = hIndex.GetInt ( GetMutableName ( MutableName_e::OPTIMIZE_CUTOFF ), g_iOptimizeCutoff );
 		m_iOptimizeCutoff = Max ( m_iOptimizeCutoff, 1 );
 		m_dLoaded.BitSet ( (int)MutableName_e::OPTIMIZE_CUTOFF );
 	}
+
+	if ( hIndex.Exists ( GetMutableName ( MutableName_e::GLOBAL_IDF ) ) )
+	{
+		m_sGlobalIDFPath = hIndex.GetStr ( GetMutableName ( MutableName_e::GLOBAL_IDF ) );
+		m_dLoaded.BitSet ( (int)MutableName_e::GLOBAL_IDF );
+	}
+
+	if ( hIndex.Exists ( GetMutableName ( MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT ) ) )
+	{
+		m_iFlushWrite = hIndex.GetInt ( GetMutableName ( MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT ) );
+		m_dLoaded.BitSet ( (int)MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT );
+	}
+
+	if ( hIndex.Exists ( GetMutableName ( MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT ) ) )
+	{
+		m_iFlushSearch = hIndex.GetInt ( GetMutableName ( MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT ) );
+		m_dLoaded.BitSet ( (int)MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT );
+	}
+
 }
 
 static void AddStr ( const CSphBitvec & dLoaded, MutableName_e eName, JsonObj_c & tRoot, const char * sVal )
@@ -2413,23 +2999,27 @@ bool MutableIndexSettings_c::Save ( CSphString & sBuf ) const
 		return false;
 
 	JsonObj_c tRoot;
-	
+
 	if ( m_dLoaded.BitGet ( (int)MutableName_e::EXPAND_KEYWORDS ) )
 		tRoot.AddStr ( "expand_keywords", GetExpandKwName ( m_iExpandKeywords ) );
 
 	AddInt ( m_dLoaded, MutableName_e::RT_MEM_LIMIT, tRoot, m_iMemLimit );
 	if ( m_dLoaded.BitGet ( (int)MutableName_e::PREOPEN ) )
 		tRoot.AddBool ( "preopen", m_bPreopen );
-	
+
 	AddStr ( m_dLoaded, MutableName_e::ACCESS_PLAIN_ATTRS, tRoot, FileAccessName ( m_tFileAccess.m_eAttr ) );
 	AddStr ( m_dLoaded, MutableName_e::ACCESS_BLOB_ATTRS, tRoot, FileAccessName ( m_tFileAccess.m_eBlob ) );
 	AddStr ( m_dLoaded, MutableName_e::ACCESS_DOCLISTS, tRoot, FileAccessName ( m_tFileAccess.m_eDoclist ) );
 	AddStr ( m_dLoaded, MutableName_e::ACCESS_HITLISTS, tRoot, FileAccessName ( m_tFileAccess.m_eHitlist ) );
+	AddStr ( m_dLoaded, MutableName_e::ACCESS_DICT, tRoot, FileAccessName ( m_tFileAccess.m_eDict ) );
 
 	AddInt ( m_dLoaded, MutableName_e::READ_BUFFER_DOCS, tRoot, m_tFileAccess.m_iReadBufferDocList );
 	AddInt ( m_dLoaded, MutableName_e::READ_BUFFER_HITS, tRoot, m_tFileAccess.m_iReadBufferHitList );
 
 	AddInt ( m_dLoaded, MutableName_e::OPTIMIZE_CUTOFF, tRoot, m_iOptimizeCutoff );
+	AddStr ( m_dLoaded, MutableName_e::GLOBAL_IDF, tRoot, m_sGlobalIDFPath.cstr() );
+	AddInt ( m_dLoaded, MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT, tRoot, m_iFlushWrite );
+	AddInt ( m_dLoaded, MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT, tRoot, m_iFlushSearch );
 
 	sBuf = tRoot.AsString ( true );
 
@@ -2476,6 +3066,11 @@ void MutableIndexSettings_c::Combine ( const MutableIndexSettings_c & tOther )
 		m_tFileAccess.m_eHitlist = tOther.m_tFileAccess.m_eHitlist;
 		m_dLoaded.BitSet ( (int)MutableName_e::ACCESS_HITLISTS );
 	}
+	if ( tOther.m_dLoaded.BitGet ( (int)MutableName_e::ACCESS_DICT ) )
+	{
+		m_tFileAccess.m_eDict = tOther.m_tFileAccess.m_eDict;
+		m_dLoaded.BitSet ( (int)MutableName_e::ACCESS_DICT );
+	}
 
 	if ( tOther.m_dLoaded.BitGet ( (int)MutableName_e::READ_BUFFER_DOCS ) )
 	{
@@ -2492,6 +3087,23 @@ void MutableIndexSettings_c::Combine ( const MutableIndexSettings_c & tOther )
 		m_iOptimizeCutoff = tOther.m_iOptimizeCutoff;
 		m_dLoaded.BitSet ( (int)MutableName_e::OPTIMIZE_CUTOFF );
 	}
+
+	if ( tOther.m_dLoaded.BitGet ( (int)MutableName_e::GLOBAL_IDF ) )
+	{
+		m_sGlobalIDFPath = tOther.m_sGlobalIDFPath;
+		m_dLoaded.BitSet ( (int)MutableName_e::GLOBAL_IDF );
+	}
+
+	if ( tOther.m_dLoaded.BitGet ( (int)MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT ) )
+	{
+		m_iFlushWrite = tOther.m_iFlushWrite;
+		m_dLoaded.BitSet ( (int)MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT );
+	}
+	if ( tOther.m_dLoaded.BitGet ( (int)MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT ) )
+	{
+		m_iFlushSearch = tOther.m_iFlushSearch;
+		m_dLoaded.BitSet ( (int)MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT );
+	}
 }
 
 MutableIndexSettings_c & MutableIndexSettings_c::GetDefaults ()
@@ -2500,39 +3112,204 @@ MutableIndexSettings_c & MutableIndexSettings_c::GetDefaults ()
 	return tMutableDefaults;
 }
 
-static bool FormatCond ( bool bNeedSave, const CSphBitvec & dLoaded, MutableName_e eName, bool bNotEq )
+static bool FormatCond ( const MutableIndexSettings_c * pOpt, MutableName_e eName, bool bNotEq )
 {
-	return ( ( bNeedSave && dLoaded.BitGet ( (int)eName ) ) || ( !bNeedSave && bNotEq ) );
+	assert ( pOpt );
+	const bool bNeedSave = pOpt->NeedSave();
+	return ( ( bNeedSave && pOpt->IsSet ( eName ) ) || ( !bNeedSave && bNotEq ) );
+}
+
+template <typename T>
+void FormatSetting ( const MutableIndexSettings_c * pOpt, SettingsFormatter_c & tOut, MutableName_e eName, const T & tVal, bool bNotEq )
+{
+	tOut.Add ( GetMutableName ( eName ), tVal, FormatCond ( pOpt, eName, bNotEq ) );
 }
 
 void MutableIndexSettings_c::Format ( SettingsFormatter_c & tOut, FilenameBuilder_i * ) const
 {
 	const MutableIndexSettings_c & tDefaults = GetDefaults ();
 
-	tOut.Add ( GetMutableName ( MutableName_e::EXPAND_KEYWORDS ), GetExpandKwName ( m_iExpandKeywords ),
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::EXPAND_KEYWORDS, m_iExpandKeywords!=tDefaults.m_iExpandKeywords ) );
-	tOut.Add ( GetMutableName ( MutableName_e::RT_MEM_LIMIT ), m_iMemLimit,
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::RT_MEM_LIMIT, m_iMemLimit!=tDefaults.m_iMemLimit ) );
-	tOut.Add ( GetMutableName ( MutableName_e::PREOPEN ), m_bPreopen,
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::PREOPEN, m_bPreopen!=tDefaults.m_bPreopen ) );
+	FormatSetting ( this, tOut, MutableName_e::EXPAND_KEYWORDS, GetExpandKwName ( m_iExpandKeywords ), m_iExpandKeywords!=tDefaults.m_iExpandKeywords );
+	FormatSetting ( this, tOut, MutableName_e::RT_MEM_LIMIT, m_iMemLimit, m_iMemLimit!=tDefaults.m_iMemLimit );
+	FormatSetting ( this, tOut, MutableName_e::PREOPEN, m_bPreopen, m_bPreopen!=tDefaults.m_bPreopen );
 
-	tOut.Add ( GetMutableName ( MutableName_e::ACCESS_PLAIN_ATTRS ), FileAccessName ( m_tFileAccess.m_eAttr ),
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::ACCESS_PLAIN_ATTRS, m_tFileAccess.m_eAttr!=tDefaults.m_tFileAccess.m_eAttr ) );
-	tOut.Add ( GetMutableName ( MutableName_e::ACCESS_BLOB_ATTRS ), FileAccessName ( m_tFileAccess.m_eBlob ),
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::ACCESS_BLOB_ATTRS, m_tFileAccess.m_eBlob!=tDefaults.m_tFileAccess.m_eBlob ) );
-	tOut.Add ( GetMutableName ( MutableName_e::ACCESS_DOCLISTS ), FileAccessName ( m_tFileAccess.m_eDoclist ),
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::ACCESS_DOCLISTS, m_tFileAccess.m_eDoclist!=tDefaults.m_tFileAccess.m_eDoclist ) );
-	tOut.Add ( GetMutableName ( MutableName_e::ACCESS_HITLISTS ), FileAccessName ( m_tFileAccess.m_eHitlist ),
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::ACCESS_HITLISTS, m_tFileAccess.m_eHitlist!=tDefaults.m_tFileAccess.m_eHitlist ) );
+	FormatSetting ( this, tOut, MutableName_e::ACCESS_PLAIN_ATTRS, FileAccessName ( m_tFileAccess.m_eAttr ), m_tFileAccess.m_eAttr!=tDefaults.m_tFileAccess.m_eAttr );
+	FormatSetting ( this, tOut, MutableName_e::ACCESS_BLOB_ATTRS, FileAccessName ( m_tFileAccess.m_eBlob ), m_tFileAccess.m_eBlob!=tDefaults.m_tFileAccess.m_eBlob );
+	FormatSetting ( this, tOut, MutableName_e::ACCESS_DOCLISTS, FileAccessName ( m_tFileAccess.m_eDoclist ), m_tFileAccess.m_eDoclist!=tDefaults.m_tFileAccess.m_eDoclist );
+	FormatSetting ( this, tOut, MutableName_e::ACCESS_HITLISTS, FileAccessName ( m_tFileAccess.m_eHitlist ), m_tFileAccess.m_eHitlist!=tDefaults.m_tFileAccess.m_eHitlist );
+	FormatSetting ( this, tOut, MutableName_e::ACCESS_DICT, FileAccessName ( m_tFileAccess.m_eDict ), m_tFileAccess.m_eDict!=tDefaults.m_tFileAccess.m_eDict );
 
-	tOut.Add ( GetMutableName ( MutableName_e::READ_BUFFER_DOCS ), m_tFileAccess.m_iReadBufferDocList,
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::READ_BUFFER_DOCS, m_tFileAccess.m_iReadBufferDocList!=tDefaults.m_tFileAccess.m_iReadBufferDocList ) );
-	tOut.Add ( GetMutableName ( MutableName_e::READ_BUFFER_HITS ), m_tFileAccess.m_iReadBufferHitList,
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::READ_BUFFER_HITS, m_tFileAccess.m_iReadBufferHitList!=tDefaults.m_tFileAccess.m_iReadBufferHitList ) );
+	FormatSetting ( this, tOut, MutableName_e::READ_BUFFER_DOCS, m_tFileAccess.m_iReadBufferDocList, m_tFileAccess.m_iReadBufferDocList!=tDefaults.m_tFileAccess.m_iReadBufferDocList );
+	FormatSetting ( this, tOut, MutableName_e::READ_BUFFER_HITS, m_tFileAccess.m_iReadBufferHitList, m_tFileAccess.m_iReadBufferHitList!=tDefaults.m_tFileAccess.m_iReadBufferHitList );
 
-	tOut.Add ( GetMutableName ( MutableName_e::OPTIMIZE_CUTOFF ), m_iOptimizeCutoff,
-		FormatCond ( m_bNeedSave, m_dLoaded, MutableName_e::OPTIMIZE_CUTOFF, HasSettings() && m_dLoaded.BitGet ( (int)MutableName_e::OPTIMIZE_CUTOFF ) ) );
+	FormatSetting ( this, tOut, MutableName_e::OPTIMIZE_CUTOFF, m_iOptimizeCutoff, IsSet ( MutableName_e::OPTIMIZE_CUTOFF ) );
+	FormatSetting ( this, tOut, MutableName_e::GLOBAL_IDF, m_sGlobalIDFPath, IsSet ( MutableName_e::GLOBAL_IDF ) );
+	FormatSetting ( this, tOut, MutableName_e::DISKCHUNK_FLUSH_WRITE_TIMEOUT, m_iFlushWrite, false );
+	FormatSetting ( this, tOut, MutableName_e::DISKCHUNK_FLUSH_SEARCH_TIMEOUT, m_iFlushSearch, false );
 }
+
+
+void LoadIndexSettingsJson ( bson::Bson_c tNode, CSphIndexSettings & tSettings )
+{
+	using namespace bson;
+	tSettings.SetMinPrefixLen ( (int)Int ( tNode.ChildByName ( "min_prefix_len" ) ) );
+	tSettings.m_iMinInfixLen = (int)Int ( tNode.ChildByName ( "min_infix_len" ) );
+	tSettings.m_iMaxSubstringLen = (int)Int ( tNode.ChildByName ( "max_substring_len" ) );
+	tSettings.m_bHtmlStrip = Bool ( tNode.ChildByName ( "strip_html" ) );
+	tSettings.m_sHtmlIndexAttrs = String ( tNode.ChildByName ( "html_index_attrs" ) );
+	tSettings.m_sHtmlRemoveElements = String ( tNode.ChildByName ( "html_remove_elements" ) );
+	tSettings.m_bIndexExactWords = Bool ( tNode.ChildByName ( "index_exact_words" ) );
+	tSettings.m_eHitless = (ESphHitless)Int ( tNode.ChildByName ( "hitless" ), SPH_HITLESS_NONE );
+	tSettings.m_eHitFormat = (ESphHitFormat)Int ( tNode.ChildByName ( "hit_format" ), SPH_HIT_FORMAT_PLAIN );
+	tSettings.m_bIndexSP = Bool ( tNode.ChildByName ( "index_sp" ) );
+	tSettings.m_sZones = String ( tNode.ChildByName ( "zones" ) );
+	tSettings.m_iBoundaryStep = (int)Int ( tNode.ChildByName ( "boundary_step" ) );
+	tSettings.m_iStopwordStep = (int)Int ( tNode.ChildByName ( "stopword_step" ), 1 );
+	tSettings.m_iOvershortStep = (int)Int ( tNode.ChildByName ( "overshort_step" ), 1 );
+	tSettings.m_iEmbeddedLimit = (int)Int ( tNode.ChildByName ( "embedded_limit" ) );
+	tSettings.m_eBigramIndex = (ESphBigram)Int ( tNode.ChildByName ( "bigram_index" ), SPH_BIGRAM_NONE );
+	tSettings.m_eBigramDelimiter = (BigramDelimiter_e)Int ( tNode.ChildByName ( "bigram_delimiter" ), (DWORD)BigramDelimiter_e::DEFAULT );
+	tSettings.m_sBigramWords = String ( tNode.ChildByName ( "bigram_words" ) );
+	tSettings.m_bIndexFieldLens = Bool ( tNode.ChildByName ( "index_field_lens" ) );
+	tSettings.m_ePreprocessor = (Preprocessor_e)Int ( tNode.ChildByName ( "icu" ), (DWORD)Preprocessor_e::NONE  );
+	tSettings.m_sIndexTokenFilter = String ( tNode.ChildByName ( "index_token_filter" ) );
+	tSettings.m_tBlobUpdateSpace = Int ( tNode.ChildByName ( "blob_update_space" ) );
+	tSettings.m_iSkiplistBlockSize = (int)Int ( tNode.ChildByName ( "skiplist_block_size" ), 32 );
+	tSettings.m_sHitlessFiles = String ( tNode.ChildByName ( "hitless_files" ) );
+	tSettings.m_eEngine = (AttrEngine_e)Int ( tNode.ChildByName ( "engine" ), (DWORD)AttrEngine_e::DEFAULT );
+	tSettings.m_eDefaultEngine = (AttrEngine_e)Int ( tNode.ChildByName ( "engine_default" ), (DWORD)AttrEngine_e::ROWWISE );
+	tSettings.m_eJiebaMode = (JiebaMode_e)Int ( tNode.ChildByName ( "jieba_mode" ), (DWORD)JiebaMode_e::DEFAULT );
+	tSettings.m_bJiebaHMM = Bool ( tNode.ChildByName ( "jieba_hmm" ), true );
+	tSettings.m_sJiebaUserDictPath = String ( tNode.ChildByName ( "jieba_user_dict_path" ) );
+}
+
+
+void LoadIndexSettings ( CSphIndexSettings & tSettings, CSphReader & tReader, DWORD uVersion )
+{
+	tSettings.SetMinPrefixLen ( tReader.GetDword() );
+	tSettings.m_iMinInfixLen = tReader.GetDword ();
+	tSettings.m_iMaxSubstringLen = tReader.GetDword();
+
+	tSettings.m_bHtmlStrip = !!tReader.GetByte ();
+	tSettings.m_sHtmlIndexAttrs = tReader.GetString ();
+	tSettings.m_sHtmlRemoveElements = tReader.GetString ();
+
+	tSettings.m_bIndexExactWords = !!tReader.GetByte ();
+	tSettings.m_eHitless = (ESphHitless)tReader.GetDword();
+
+	tSettings.m_eHitFormat = (ESphHitFormat)tReader.GetDword();
+	tSettings.m_bIndexSP = !!tReader.GetByte();
+
+	tSettings.m_sZones = tReader.GetString();
+
+	tSettings.m_iBoundaryStep = (int)tReader.GetDword();
+	tSettings.m_iStopwordStep = (int)tReader.GetDword();
+
+	tSettings.m_iOvershortStep = (int)tReader.GetDword();
+	tSettings.m_iEmbeddedLimit = (int)tReader.GetDword();
+
+	tSettings.m_eBigramIndex = (ESphBigram)tReader.GetByte();
+	if ( uVersion>=69 )
+		tSettings.m_eBigramDelimiter = (BigramDelimiter_e)tReader.GetByte();
+	else
+		tSettings.m_eBigramDelimiter = BigramDelimiter_e::DEFAULT;
+	tSettings.m_sBigramWords = tReader.GetString();
+
+	tSettings.m_bIndexFieldLens = ( tReader.GetByte()!=0 );
+
+	tSettings.m_ePreprocessor = tReader.GetByte()==1 ? Preprocessor_e::ICU : Preprocessor_e::NONE;
+	tReader.GetString(); // was: RLP context
+
+	tSettings.m_sIndexTokenFilter = tReader.GetString();
+	tSettings.m_tBlobUpdateSpace = tReader.GetOffset();
+
+	if ( uVersion<56 )
+		tSettings.m_iSkiplistBlockSize = 128;
+	else
+		tSettings.m_iSkiplistBlockSize = (int)tReader.GetDword();
+
+	if ( uVersion>=60 )
+		tSettings.m_sHitlessFiles = tReader.GetString();
+
+	if ( uVersion>=63 )
+		tSettings.m_eEngine = (AttrEngine_e)tReader.GetDword();
+
+	if ( uVersion>=67 )
+	{
+		tSettings.m_eJiebaMode = (JiebaMode_e)tReader.GetDword();
+		tSettings.m_bJiebaHMM = !!tReader.GetByte();
+	}
+}
+
+
+void SaveIndexSettings ( Writer_i & tWriter, const CSphIndexSettings & tSettings )
+{
+	tWriter.PutDword ( tSettings.RawMinPrefixLen() );
+	tWriter.PutDword ( tSettings.m_iMinInfixLen );
+	tWriter.PutDword ( tSettings.m_iMaxSubstringLen );
+	tWriter.PutByte ( tSettings.m_bHtmlStrip ? 1 : 0 );
+	tWriter.PutString ( tSettings.m_sHtmlIndexAttrs.cstr () );
+	tWriter.PutString ( tSettings.m_sHtmlRemoveElements.cstr () );
+	tWriter.PutByte ( tSettings.m_bIndexExactWords ? 1 : 0 );
+	tWriter.PutDword ( tSettings.m_eHitless );
+	tWriter.PutDword ( tSettings.m_eHitFormat );
+	tWriter.PutByte ( tSettings.m_bIndexSP );
+	tWriter.PutString ( tSettings.m_sZones );
+	tWriter.PutDword ( tSettings.m_iBoundaryStep );
+	tWriter.PutDword ( tSettings.m_iStopwordStep );
+	tWriter.PutDword ( tSettings.m_iOvershortStep );
+	tWriter.PutDword ( tSettings.m_iEmbeddedLimit );
+	tWriter.PutByte ( tSettings.m_eBigramIndex );
+	tWriter.PutByte ( (BYTE)tSettings.m_eBigramDelimiter );
+	tWriter.PutString ( tSettings.m_sBigramWords );
+	tWriter.PutByte ( tSettings.m_bIndexFieldLens );
+	tWriter.PutByte ( tSettings.m_ePreprocessor==Preprocessor_e::ICU ? 1 : 0 );
+	tWriter.PutString("");	// was: RLP context
+	tWriter.PutString ( tSettings.m_sIndexTokenFilter );
+	tWriter.PutOffset ( tSettings.m_tBlobUpdateSpace );
+	tWriter.PutDword ( tSettings.m_iSkiplistBlockSize );
+	tWriter.PutString ( tSettings.m_sHitlessFiles );
+	tWriter.PutDword ( (DWORD)tSettings.m_eEngine );
+	tWriter.PutDword ( (DWORD)tSettings.m_eJiebaMode );
+	tWriter.PutByte ( tSettings.m_bJiebaHMM ? 1 : 0 );
+	tWriter.PutString ( tSettings.m_sJiebaUserDictPath );
+}
+
+
+void operator << ( JsonEscapedBuilder & tOut, const CSphIndexSettings & tSettings )
+{
+	auto _ = tOut.ObjectW();
+	tOut.NamedValNonDefault ( "min_prefix_len", tSettings.RawMinPrefixLen() );
+	tOut.NamedValNonDefault ( "min_infix_len", tSettings.m_iMinInfixLen );
+	tOut.NamedValNonDefault ( "max_substring_len", tSettings.m_iMaxSubstringLen );
+	tOut.NamedValNonDefault ( "strip_html", tSettings.m_bHtmlStrip, false );
+	tOut.NamedStringNonEmpty ( "html_index_attrs", tSettings.m_sHtmlIndexAttrs );
+	tOut.NamedStringNonEmpty ( "html_remove_elements", tSettings.m_sHtmlRemoveElements );
+	tOut.NamedValNonDefault ( "index_exact_words", tSettings.m_bIndexExactWords, false );
+	tOut.NamedValNonDefault ( "hitless", tSettings.m_eHitless, SPH_HITLESS_NONE );
+	tOut.NamedValNonDefault ( "hit_format", tSettings.m_eHitFormat, SPH_HIT_FORMAT_PLAIN );
+	tOut.NamedValNonDefault ( "index_sp", tSettings.m_bIndexSP, false );
+	tOut.NamedStringNonEmpty ( "zones", tSettings.m_sZones );
+	tOut.NamedValNonDefault ( "boundary_step", tSettings.m_iBoundaryStep );
+	tOut.NamedValNonDefault ( "stopword_step", tSettings.m_iStopwordStep, 1 );
+	tOut.NamedValNonDefault ( "overshort_step", tSettings.m_iOvershortStep, 1 );
+	tOut.NamedValNonDefault ( "embedded_limit", tSettings.m_iEmbeddedLimit );
+	tOut.NamedValNonDefault ( "bigram_index", tSettings.m_eBigramIndex, SPH_BIGRAM_NONE );
+	tOut.NamedValNonDefault ( "bigram_delimiter", (DWORD)tSettings.m_eBigramDelimiter, (DWORD)BigramDelimiter_e::DEFAULT );
+	tOut.NamedStringNonEmpty ( "bigram_words", tSettings.m_sBigramWords );
+	tOut.NamedValNonDefault ( "index_field_lens", tSettings.m_bIndexFieldLens, false );
+	tOut.NamedValNonDefault ( "icu", (DWORD)tSettings.m_ePreprocessor, (DWORD)Preprocessor_e::NONE );
+	tOut.NamedStringNonEmpty ( "index_token_filter", tSettings.m_sIndexTokenFilter );
+	tOut.NamedValNonDefault ( "blob_update_space", tSettings.m_tBlobUpdateSpace );
+	tOut.NamedValNonDefault ( "skiplist_block_size", tSettings.m_iSkiplistBlockSize, 32 );
+	tOut.NamedStringNonEmpty ( "hitless_files", tSettings.m_sHitlessFiles );
+	tOut.NamedValNonDefault ( "engine", (DWORD)tSettings.m_eEngine, (DWORD)AttrEngine_e::DEFAULT );
+	tOut.NamedValNonDefault ( "engine_default", (DWORD)tSettings.m_eDefaultEngine, (DWORD)AttrEngine_e::ROWWISE );
+	tOut.NamedValNonDefault ( "jieba_mode", (DWORD)tSettings.m_eJiebaMode, (DWORD)JiebaMode_e::DEFAULT );
+	tOut.NamedValNonDefault ( "jieba_hmm", tSettings.m_bJiebaHMM, true );
+	tOut.NamedStringNonEmpty ( "jieba_user_dict_path", tSettings.m_sJiebaUserDictPath );
+}
+
 
 void SaveMutableSettings ( const MutableIndexSettings_c & tSettings, const CSphString & sSettingsFile )
 {
@@ -2543,7 +3320,7 @@ void SaveMutableSettings ( const MutableIndexSettings_c & tSettings, const CSphS
 	CSphString sError;
 	CSphString sSettingsFileNew = SphSprintf ( "%s.new", sSettingsFile.cstr() );
 
-	CSphWriter tWriter;
+	CSphWriterNonThrottled tWriter;
 	if ( !tWriter.OpenFile ( sSettingsFileNew, sError ) )
 		sphDie ( "failed to serialize mutable settings: %s", sError.cstr() ); // !COMMIT handle this gracefully
 
@@ -2581,4 +3358,228 @@ void SetDefaultAttrEngine ( AttrEngine_e eEngine )
 AttrEngine_e GetDefaultAttrEngine()
 {
 	return g_eAttrEngine;
+}
+
+static void ParseListVals ( const CSphString & sVal, StringBuilder_c & sRes, CSphString & sError )
+{
+	if ( sVal.IsEmpty() )
+		return;
+	
+	// fix sVal in place to unescape
+	char * pWrite = const_cast<char*>( sVal.cstr() );
+	const char * pRead = sVal.cstr();
+	const char * pEnd = pRead + sVal.Length();
+	
+	while ( pRead<pEnd )
+	{
+		while ( pRead<pEnd && sphIsSpace ( *pRead ) )
+			pRead++;
+		
+		if ( pRead>=pEnd )
+			break;
+
+		const char * pEntryStart = pWrite;
+		
+		while ( pRead<pEnd )
+		{
+			// escape sequence
+			if ( *pRead=='\\' && ( pRead+1 )<pEnd )
+			{
+				char cNext = *( pRead+1 );
+				if ( cNext==';' )
+				{
+					// unescape \; to ;
+					pRead++;
+					*pWrite++ = *pRead++;
+
+				} else
+				{
+					*pWrite++ = *pRead++;
+					*pWrite++ = *pRead++;
+				}
+				continue;
+			}
+			
+			// check for ; separator
+			if ( *pRead==';' )
+			{
+				pRead++;
+				break;
+			}
+			
+			*pWrite++ = *pRead++;
+		}
+		
+		if ( pWrite>pEntryStart )
+		{
+			Str_t sEntry { pEntryStart, ( pWrite - pEntryStart ) };
+			sRes << sEntry;
+		}
+	}
+}
+
+static void ProcessLine ( CSphVector<char> & dLine, bool bSplitLine, StringBuilder_c & sRes )
+{
+	if ( dLine.IsEmpty() )
+		return;
+
+	if ( bSplitLine )
+	{
+		const char * pLine = dLine.Begin();
+		const char * pLineEnd = pLine + dLine.GetLength();
+					
+		while ( pLine<pLineEnd )
+		{
+			while ( pLine<pLineEnd && sphIsSpace ( *pLine ) )
+				pLine++;
+						
+			if ( pLine>=pLineEnd )
+				break;
+						
+			// new token
+			const char * pTokenStart = pLine;
+			while ( pLine < pLineEnd && !sphIsSpace ( *pLine ) )
+				pLine++;
+						
+			Str_t sToken { pTokenStart, pLine - pTokenStart };
+			if ( !IsEmpty ( sToken ) )
+				sRes << sToken;
+		}
+	}
+	else
+	{
+		sRes << Str_t { dLine.Begin(), dLine.GetLength() };
+	}
+				
+	dLine.Resize ( 0 );
+}
+
+static void ParseFileContent ( CSphAutoreader & tReader, bool bSplitLine, StringBuilder_c & sRes )
+{
+	const int iReadBlock = 4 * 1024;
+	CSphVector<char> dLine ( iReadBlock + 2 );
+	dLine.Resize ( 0 );
+	
+	while ( true )
+	{
+		const BYTE * pData = nullptr;
+		int iGot = tReader.GetBytesZerocopy ( &pData, iReadBlock );
+		if ( iGot<=0 )
+			break;
+		
+		const BYTE * s = pData;
+		const BYTE * pEnd = pData + iGot;
+		
+		while ( s<pEnd )
+		{
+			if ( *s=='\n' || *s=='\r' )
+			{
+				ProcessLine ( dLine, bSplitLine, sRes );
+				
+				// skip newline
+				s++;
+				while ( s<pEnd && ( *s=='\n' || *s=='\r' ) )
+					s++;
+
+				continue;
+			}
+			
+			// accumulate chars for whole line and escape separator chars
+			if ( *s == ';' )
+				dLine.Add ( '\\' );
+			dLine.Add ( *s );
+			s++;
+		}
+	}
+	
+	// tail line
+	ProcessLine ( dLine, bSplitLine, sRes );
+}
+
+void FormatFileContent ( const CSphString & sFile, FilenameBuilder_i * pFilenameBuilder, bool bSplitLine, StringBuilder_c & sRes )
+{
+	CSphString sFilePath = FormatPath ( sFile, pFilenameBuilder );
+	if ( sFilePath.IsEmpty() )
+		return;
+	
+	CSphString sError;
+	CSphAutoreader tRd;
+	if ( !tRd.Open ( sFilePath, sError ) )
+		return;
+	
+	ParseFileContent ( tRd, bSplitLine, sRes );
+}
+
+void FormatFileContent ( const VecTraits_T<CSphString> & dFiles, FilenameBuilder_i * pFilenameBuilder, bool bSplitLine, StringBuilder_c & sRes )
+{
+	for ( const auto & sFile : dFiles )
+		FormatFileContent ( sFile, pFilenameBuilder, bSplitLine, sRes );
+}
+
+bool IndexSettingsContainer_c::CopyListFiles ( const ExtFiles_t & tExt, const CSphString & sDestPath, const char * sKeyName, int iSuffix, int & iFile, StringBuilder_c & sFilesOpt )
+{
+	assert ( tExt.m_bFilesSet && !tExt.m_sListVals.IsEmpty() );
+
+	// _list values
+	StringBuilder_c sContent ( "\n" );
+	ParseListVals ( tExt.m_sListVals, sContent, m_sError );
+
+	CSphString sDstFile = GetExternalName ( sDestPath, sKeyName, iSuffix, iFile );
+	CSphWriter tWriter;
+	if ( !tWriter.OpenFile ( sDstFile, m_sError ) )
+		return false;
+
+	tWriter.PutBytes ( sContent.cstr(), sContent.GetLength() );
+	tWriter.CloseFile();
+
+	if ( tWriter.IsError() )
+		return false;
+
+	m_dCleanupFiles.Add ( sDstFile );
+	sFilesOpt << StripPath ( sDstFile ).cstr();
+
+	return true;
+}
+
+bool BigramNeedsFreq ( ESphBigram eMode ) noexcept
+{
+	return eMode==SPH_BIGRAM_FIRSTFREQ || eMode==SPH_BIGRAM_BOTHFREQ;
+}
+
+bool BigramHasDigit ( const BYTE * pWord, int iLen ) noexcept
+{
+	assert ( iLen>=0 );
+	for ( int i=0; i<iLen; ++i )
+		if ( pWord[i]>='0' && pWord[i]<='9' )
+			return true;
+
+	return false;
+}
+
+bool BigramIsDigitsOnly ( const BYTE * pWord, int iLen ) noexcept
+{
+	assert ( iLen>=0 );
+	if ( !iLen )
+		return false;
+
+	for ( int i=0; i<iLen; ++i )
+		if ( pWord[i]<'0' || pWord[i]>'9' )
+			return false;
+
+	return true;
+}
+
+bool BigramIsSecondDigit ( ESphBigram eMode, const BYTE * pSecond, int iLen ) noexcept
+{
+	switch ( eMode )
+	{
+	case SPH_BIGRAM_SECONDNUMERIC:
+		return BigramIsDigitsOnly ( pSecond, iLen );
+
+	case SPH_BIGRAM_SECONDHASDIGIT:
+		return BigramHasDigit ( pSecond, iLen );
+
+	default:
+		return false;
+	}
 }

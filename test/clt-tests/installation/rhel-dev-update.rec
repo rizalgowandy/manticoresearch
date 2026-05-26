@@ -1,0 +1,27 @@
+––– block: manticore-and-packages-installation –––
+––– block: start-searchd-release –––
+––– block: check-searchd-process –––
+––– block: check-backup –––
+––– block: check-version/export-current-version –––
+––– input –––
+yum -y --setopt=tsflags=noscripts remove 'manticore*' > /dev/null 2>&1; echo $?
+––– output –––
+0
+––– input –––
+yum install -y -q https://repo.manticoresearch.com/manticore-repo.noarch.rpm > /dev/null 2>&1; echo $?
+––– output –––
+0
+––– input –––
+yum -y --disablerepo=manticore --enablerepo manticore-dev install manticore > /dev/null 2>&1; echo $?
+––– output –––
+0
+––– block: stop-searchd-dev –––
+––– block: start-searchd-dev –––
+––– block: check-version/export-new-version –––
+––– input –––
+yum remove -y 'manticore*' > /dev/null 2>&1; echo $?
+––– output –––
+0
+––– input –––
+rpm -qa | grep manticore
+––– output –––

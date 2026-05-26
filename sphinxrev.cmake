@@ -13,6 +13,10 @@ function ( guess_from_git )
 		return ()
 	endif ()
 
+	# without this in some environments you can get error "detected dubious ownership in repository"
+	# `git config --global --add safe.directory '*'` in the docker image it runs in may not help. TODO: check why
+  execute_process ( COMMAND "${GIT_EXECUTABLE}" config --global --add safe.directory "${MANTICORE_SOURCE_DIR}")
+
 	# extract short has as SPH_GIT_COMMIT_ID
 	execute_process ( COMMAND "${GIT_EXECUTABLE}" log -1 --format=%h
 			WORKING_DIRECTORY "${MANTICORE_SOURCE_DIR}"
@@ -22,19 +26,17 @@ function ( guess_from_git )
 			OUTPUT_STRIP_TRAILING_WHITESPACE )
 	set ( SPH_GIT_COMMIT_ID "${SPH_GIT_COMMIT_ID}" PARENT_SCOPE )
 
-	# extract timestamp and make number YYMMDD from it
-	# it would be --date=format:%y%m%d, but old git on centos doesn't understand it
-	execute_process ( COMMAND "${GIT_EXECUTABLE}" log -1 --date=short --format=%cd
+	# extract timestamp and make number YYMMDDHH from it
+	execute_process ( COMMAND "${GIT_EXECUTABLE}" log -1 --date=format-local:"%y%m%d%H" --format=%cd
 			WORKING_DIRECTORY "${MANTICORE_SOURCE_DIR}"
 			RESULT_VARIABLE res
 			OUTPUT_VARIABLE GIT_TIMESTAMP_ID
-			ERROR_QUIET
 			OUTPUT_STRIP_TRAILING_WHITESPACE )
-	string ( REPLACE "-" "" GIT_TIMESTAMP_ID "${GIT_TIMESTAMP_ID}" )
-	string ( SUBSTRING "${GIT_TIMESTAMP_ID}" 2 -1 GIT_TIMESTAMP_ID )
-	set ( GIT_TIMESTAMP_ID "${GIT_TIMESTAMP_ID}" PARENT_SCOPE )
 
-	# timestamp for reproducable packages
+	string ( SUBSTRING "${GIT_TIMESTAMP_ID}" 1 8 GIT_TIMESTAMP_ID )
+	set ( GIT_TIMESTAMP_ID ${GIT_TIMESTAMP_ID} PARENT_SCOPE )
+
+	# timestamp for reproducible packages
 	execute_process ( COMMAND "${GIT_EXECUTABLE}" log -1 --pretty=%ct
 			WORKING_DIRECTORY "${MANTICORE_SOURCE_DIR}"
 			RESULT_VARIABLE res
@@ -114,17 +116,6 @@ if (NOT SPH_GIT_COMMIT_ID)
 endif ()
 
 set ( GDB_SOURCE_DIR "${MANTICORE_SOURCE_DIR}" )
-
-# determine build tag as even/odd value of patch version
-if (NOT BUILD_TAG)
-	string ( REGEX MATCH "[0-9]+.[0-9]+.([0-9]+)" _ ${VERNUMBERS} )
-	math ( EXPR oddvalue "${CMAKE_MATCH_1} % 2" OUTPUT_FORMAT DECIMAL )
-
-	if (oddvalue)
-		set ( BUILD_TAG "dev" )
-		set ( DEV_BUILD ON )
-	endif ()
-endif ()
 
 # All info collected (we need SPH_GIT_COMMIT_ID, GIT_TIMESTAMP_ID, GIT_BRANCH_ID and BUILD_TAG, if any)
 set ( VERFILE "${MANTICORE_BINARY_DIR}/config/gen_sphinxversion.h" )

@@ -1,13 +1,17 @@
 # only cmake since 3.17 supports packaging of debuginfo
 cmake_minimum_required ( VERSION 3.17 )
 
+set ( CMAKE_INSTALL_FULL_RUNSTATEDIR "/run")
+set ( CMAKE_INSTALL_RUNSTATEDIR "run")
+
 if (NOT installed)
 	# start with short route - set all paths
 	set ( CPACK_PACKAGING_INSTALL_PREFIX "/" )
 	set ( CMAKE_INSTALL_PREFIX "${CPACK_PACKAGING_INSTALL_PREFIX}" CACHE PATH "prefix from distr build" FORCE )
 	include ( GNUInstallDirs )
 	SET ( FULL_SHARE_DIR "${CMAKE_INSTALL_FULL_DATADIR}/manticore" )
-	SET ( LOCALDATADIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/lib/manticore/data" ) # will be used also in the app
+	SET ( LOCALDATADIR "${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/lib/manticore" ) # will be used also in the app
+	SET ( CMAKE_INSTALL_FULL_LOCALLIBDIR "${CMAKE_INSTALL_PREFIX}usr/local/lib" )
 	set ( installed ON )
 	diag ( CPACK_PACKAGING_INSTALL_PREFIX CMAKE_INSTALL_PREFIX )
 endif ()
@@ -30,7 +34,8 @@ set ( CPACK_GENERATOR DEB )
 
 # Parse version dependencies from file and assign it to vars
 include( builds/VersionDeps )
-set ( DEP_BUDDY_VERSION "${BUDDY_VERNUM}-${BUDDY_VERDATE}-${BUDDY_VERHASH}" )
+set ( DEP_TZDATA_VERSION "${TZDATA_VERNUM}-${TZDATA_VERDATE}-${TZDATA_VERHASH}" )
+set ( DEP_BUDDY_VERSION "${BUDDY_VERNUM}+${BUDDY_VERDATE}-${BUDDY_VERHASH}" )
 set ( DEP_BACKUP_VERSION "${BACKUP_VERNUM}-${BACKUP_VERDATE}-${BACKUP_VERHASH}" )
 
 set ( CPACK_COMPONENTS_GROUPING IGNORE )
@@ -52,14 +57,18 @@ set ( CPACK_DEBIAN_PACKAGE_PRIORITY "optional" )
 set ( dirserver "${MANTICORE_BINARY_DIR}/config/server" )
 set ( dircommon "${MANTICORE_BINARY_DIR}/config/common" )
 set ( dircore "${MANTICORE_BINARY_DIR}/config/core" )
+set ( dirtools "${MANTICORE_BINARY_DIR}/config/tools" )
+# Bundle control files are generated alongside the split-package control files.
+set ( dirbundle "${MANTICORE_BINARY_DIR}/config/bundle" )
 
 set ( CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION ON )
 
 set ( CPACK_DEBIAN_SEARCHD_PACKAGE_NAME "manticore-server-core" )
 set ( CPACK_DEBIAN_SEARCHD_PACKAGE_REPLACES "manticore-bin, sphinxsearch, ${breaks}" )
 set ( CPACK_DEBIAN_SEARCHD_PACKAGE_CONTROL_EXTRA "${dircore}/postinst;${dircore}/postrm" )
-seta ( CPACK_DEBIAN_SEARCHD_PACKAGE_DEPENDS "manticore-common (= ${CPACK_PACKAGE_VERSION})" )
+seta ( CPACK_DEBIAN_SEARCHD_PACKAGE_DEPENDS "manticore-common (= ${CPACK_PACKAGE_VERSION}), manticore-tzdata (>= ${DEP_TZDATA_VERSION}), manticore-tzdata (<< ${TZDATA_VERNUM_MAX})" )
 seta ( CPACK_DEBIAN_SEARCHD_PACKAGE_SUGGESTS "manticore-server (= ${CPACK_PACKAGE_VERSION})" )
+#seta ( CPACK_DEBIAN_SEARCHD_PACKAGE_SUGGESTS "manticore-galera" )
 set ( CPACK_DEBIAN_SEARCHD_PACKAGE_BREAKS "${breaks}" )
 
 set ( CPACK_DEBIAN_SERVER_PACKAGE_NAME "manticore-server" )
@@ -73,6 +82,7 @@ set ( CPACK_DEBIAN_TOOLS_PACKAGE_NAME "manticore-tools" )
 seta ( CPACK_DEBIAN_TOOLS_PACKAGE_DEPENDS "manticore-common (= ${CPACK_PACKAGE_VERSION})" )
 set ( CPACK_DEBIAN_TOOLS_PACKAGE_RECOMMENDS "manticore-backup (>= ${DEP_BACKUP_VERSION} ), manticore-backup(<< ${BACKUP_VERNUM_MAX} )" )
 set ( CPACK_DEBIAN_TOOLS_PACKAGE_CONFLICTS "sphinxsearch, manticore (<< 3.5.0-200722-1d34c491)" )
+set ( CPACK_DEBIAN_TOOLS_PACKAGE_CONTROL_EXTRA "${dirtools}/conffiles" )
 set ( CPACK_DEBIAN_TOOLS_PACKAGE_REPLACES "${breaks}" )
 set ( CPACK_DEBIAN_TOOLS_PACKAGE_BREAKS "${breaks}" )
 
@@ -125,10 +135,14 @@ configure_config ( lib/manticore )
 # configure conffiles
 configure_file ( "dist/deb/conffiles-common.in" "${dircommon}/conffiles" @ONLY )
 configure_file ( "dist/deb/conffiles-server.in" "${dirserver}/conffiles" @ONLY )
+configure_file ( "dist/deb/conffiles-tools.in" "${dirtools}/conffiles" @ONLY )
 
 configure_file ( "dist/deb/manticore.default.in" "${dirserver}/manticore" @ONLY )
-configure_file ( "dist/deb/manticore.init.in" "${dirserver}/manticore.init" @ONLY )
 configure_file ( "dist/deb/manticore.service.in" "${dirserver}/manticore.service" @ONLY )
+
+configure_file ( "dist/deb/manticore-indexer.service.in" "${dirtools}/manticore-indexer.service" @ONLY )
+configure_file ( "dist/deb/manticore-indexer@.service.in" "${dirtools}/manticore-indexer@.service" @ONLY )
+configure_file ( "dist/deb/manticore-indexer_global.default.in" "${dirtools}/manticore-indexer_global" @ONLY )
 
 configure_file ( "dist/deb/README.Debian.in" "${MANTICORE_BINARY_DIR}/README.Debian" @ONLY )
 configure_file ( "dist/deb/manticore.logrotate.in" "${MANTICORE_BINARY_DIR}/manticore.logrotate" @ONLY )
@@ -145,6 +159,32 @@ configure_file ( "${dircore}/postrm.in" "${dircore}/postrm" @ONLY )
 configure_file ( "${dirserver}/postinst.in" "${dirserver}/postinst" @ONLY )
 configure_file ( "${dirserver}/prerm.in" "${dirserver}/prerm" @ONLY )
 configure_file ( "${dirserver}/postrm.in" "${dirserver}/postrm" @ONLY )
+if ( PACK_BUNDLE AND NOT WIN32 )
+	file ( MAKE_DIRECTORY "${dirbundle}" )
+	# The bundle package reuses the split package maintainer scripts instead of
+	# carrying a separate implementation with divergent service/setup logic.
+	# Reuse common + core + server scripts: concatenate into bundle postinst
+	file ( READ "${dircommon}/postinst" _BUNDLE_PI_COMMON )
+	file ( READ "${dircore}/postinst" _BUNDLE_PI_CORE )
+	file ( READ "${dirserver}/postinst" _BUNDLE_PI_SERVER )
+	file ( WRITE "${dirbundle}/postinst" "${_BUNDLE_PI_COMMON}\n${_BUNDLE_PI_CORE}\n${_BUNDLE_PI_SERVER}\n" )
+	# Reuse common + core + server postrm
+	file ( READ "${dircommon}/postrm" _BUNDLE_PRM_COMMON )
+	file ( READ "${dircore}/postrm" _BUNDLE_PRM_CORE )
+	file ( READ "${dirserver}/postrm" _BUNDLE_PRM_SERVER )
+	file ( WRITE "${dirbundle}/postrm" "${_BUNDLE_PRM_COMMON}\n${_BUNDLE_PRM_CORE}\n${_BUNDLE_PRM_SERVER}\n" )
+	# Reuse server prerm
+	file ( READ "${dirserver}/prerm" _BUNDLE_PREM )
+	file ( WRITE "${dirbundle}/prerm" "${_BUNDLE_PREM}" )
+	# Reuse common + server + tools conffiles
+	file ( READ "${dircommon}/conffiles" _BUNDLE_CF_COMMON )
+	file ( READ "${dirserver}/conffiles" _BUNDLE_CF_SERVER )
+	file ( READ "${dirtools}/conffiles" _BUNDLE_CF_TOOLS )
+	file ( WRITE "${dirbundle}/conffiles" "${_BUNDLE_CF_COMMON}
+${_BUNDLE_CF_SERVER}
+${_BUNDLE_CF_TOOLS}" )
+	set ( CPACK_DEBIAN_BUNDLE_PACKAGE_CONTROL_EXTRA "${dirbundle}/conffiles;${dirbundle}/postinst;${dirbundle}/prerm;${dirbundle}/postrm" )
+endif ()
 
 # installation
 
@@ -152,18 +192,19 @@ configure_file ( "${dirserver}/postrm.in" "${dirserver}/postrm" @ONLY )
 # CMAKE_INSTALL_SYSCONFDIR					etc 					/etc
 install ( FILES ${MANTICORE_BINARY_DIR}/manticore.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/manticoresearch COMPONENT common )
 install ( FILES "${dirserver}/manticore" DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/default COMPONENT server )
-install ( FILES "${dirserver}/manticore.init" DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/init.d
-		PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ GROUP_EXECUTE GROUP_READ COMPONENT server RENAME manticore )
 install ( FILES ${MANTICORE_BINARY_DIR}/manticore.logrotate DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/logrotate.d COMPONENT searchd RENAME manticore )
+install ( FILES ${dirtools}/manticore-indexer_global DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/default COMPONENT tools )
 
 # stuff going to /var
 # CMAKE_INSTALL_LOCALSTATEDIR				var 					/var
-install ( DIRECTORY DESTINATION ${CMAKE_INSTALL_LOCALSTATEDIR}/lib/manticore/data COMPONENT common )
+install ( DIRECTORY DESTINATION ${CMAKE_INSTALL_LOCALSTATEDIR}/lib/manticore COMPONENT common )
 install ( DIRECTORY DESTINATION ${CMAKE_INSTALL_LOCALSTATEDIR}/log/manticore COMPONENT searchd )
 
 # stuff that should go to /lib -> actually to /usr/lib
 # CMAKE_INSTALL_LIBDIR						usr/lib64 				/usr/lib64
 install ( FILES "${dirserver}/manticore.service" DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system COMPONENT server )
+install ( FILES "${dirtools}/manticore-indexer.service" DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system COMPONENT tools )
+install ( FILES "${dirtools}/manticore-indexer@.service" DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system COMPONENT tools )
 
 # binaries go to /usr/bin (here is only new cluster, rest is in main file, installing targets)
 # CMAKE_INSTALL_BINDIR						usr/bin 				/usr/bin
@@ -177,9 +218,9 @@ GNUInstallDirs_get_absolute_install_dir ( CMAKE_INSTALL_FULL_DOCDIR CMAKE_INSTAL
 # CMAKE_INSTALL_MANDIR						usr/share/man 			/usr/share/man
 # CMAKE_INSTALL_DOCDIR						usr/share/doc/manticore /usr/share/doc/manticore
 install ( FILES doc/searchd.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 COMPONENT searchd )
-install ( FILES doc/indexer.1 doc/indextool.1 doc/spelldump.1 doc/wordbreaker.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 COMPONENT tools )
+install ( FILES doc/indexer.1 doc/indextool.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 COMPONENT tools )
 install ( FILES "${MANTICORE_BINARY_DIR}/README.Debian" DESTINATION ${CMAKE_INSTALL_DOCDIR} COMPONENT common )
-install ( FILES COPYING INSTALL DESTINATION ${CMAKE_INSTALL_DOCDIR} COMPONENT common )
+install ( FILES LICENSE INSTALL DESTINATION ${CMAKE_INSTALL_DOCDIR} COMPONENT common )
 install ( FILES example.sql DESTINATION ${CMAKE_INSTALL_DOCDIR} COMPONENT tools )
 
 # stuff going to /usr/share/manticore
@@ -191,6 +232,9 @@ install ( DIRECTORY DESTINATION ${CMAKE_INSTALL_DATADIR}/manticore/modules COMPO
 # stuff going to /usr/local/
 install ( DIRECTORY DESTINATION /usr/local/lib/manticore COMPONENT common )
 
+# Install sysctl configuration for Manticore Search
+install ( FILES dist/70-manticore.conf DESTINATION /etc/sysctl.d COMPONENT server )
+
 if (WITH_ICU AND WITH_ICU_FORCE_STATIC)
 	install_icudata ( ${CMAKE_INSTALL_DATADIR}/manticore/icu )
 endif ()
@@ -199,7 +243,18 @@ if (NOT NOAPI)
 	install ( DIRECTORY api DESTINATION ${CMAKE_INSTALL_DATADIR}/manticore COMPONENT searchd )
 endif ()
 
+if ( PACK_BUNDLE AND NOT WIN32 )
+	# Install the merged bundle payload in addition to the normal split packages.
+	_manticore_bundle_base_install_rules ()
+	# Bundle: server/tools extras this distro creates (Debian has etc/default/manticore; RPM does not).
+	install ( FILES "${dirserver}/manticore" DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/default COMPONENT bundle )
+	_manticore_bundle_server_tools_install_rules ()
+endif ()
+
 get_cmake_property ( CPACK_COMPONENTS_ALL COMPONENTS )
+if (NOT PACK_BUNDLE)
+	# In bundle mode, the bundle component replaces the old meta package entry.
 list ( APPEND CPACK_COMPONENTS_ALL "meta" )
+endif ()
 
 # set(CPACK_DEBIAN_PACKAGE_DEBUG ON)

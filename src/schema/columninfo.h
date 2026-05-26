@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -15,8 +15,19 @@
 #include "sphinxstd.h"
 
 #include "sphinxdefs.h"
+#include "aggrexpr.h"
 #include "locator.h"
 #include "sphinxexpr.h"
+#include "knn/knn.h"
+
+class CSphWriter;
+class CSphReader;
+
+struct NamedKNNSettings_t : public knn::IndexSettings_t, public knn::ModelSettings_t
+{
+	CSphString	m_sName;
+	CSphString	m_sFrom;
+};
 
 /// source column info
 struct CSphColumnInfo
@@ -34,11 +45,15 @@ struct CSphColumnInfo
 		ATTR_NONE				= 0,
 		ATTR_COLUMNAR			= 1 << 0,
 		ATTR_COLUMNAR_HASHES	= 1 << 1,
-		ATTR_STORED				= 1 << 2
+		ATTR_STORED				= 1 << 2,
+		ATTR_INDEXED_KNN		= 1 << 3,
+		ATTR_JOINED				= 1 << 4,
+		ATTR_INDEXED_SI			= 1 << 5
 	};
 
 	CSphString		m_sName;							///< column name
 	ESphAttr		m_eAttrType;						///< attribute type
+	ESphAttr		m_eAggrInputType { SPH_ATTR_NONE };///< original attr type for aggregate inputs
 
 	ESphWordpart	m_eWordpart { SPH_WORDPART_WHOLE };	///< wordpart processing type
 	bool			m_bIndexed = false;					///< whether to index this column as fulltext field too
@@ -60,6 +75,13 @@ struct CSphColumnInfo
 	DWORD			m_uAttrFlags = ATTR_NONE;			///< attribute storage spec
 	AttrEngine_e	m_eEngine = AttrEngine_e::DEFAULT;	///< used together with per-table engine specs to determine attribute storage
 
+	knn::IndexSettings_t m_tKNN;						///< knn index settings
+	knn::ModelSettings_t m_tKNNModel;					///< knn model settings
+	CSphString		m_sKNNFrom;							///< fields/attrs used by the model
+
+	float			m_fTdigestCompression = 200.0f;		///< tdigest compression for extended aggs
+	AggrSettings_t	m_tAggrSettings;					///< full settings payload for extended aggs
+
 	WORD			m_uNext = 0xFFFF;					///< next in linked list for hash in CSphSchema
 
 	/// handy ctor
@@ -75,6 +97,10 @@ struct CSphColumnInfo
 	bool HasStringHashes() const;
 	bool IsColumnarExpr() const;
 	bool IsStoredExpr() const;
+	bool IsIndexedKNN() const;
+	bool IsJoined() const;
+	bool IsIndexedSI() const;
+	bool IsStored() const;
 };
 
 

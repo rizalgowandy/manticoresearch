@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -13,6 +13,7 @@
 #include "env.h"
 
 #include "sphinxutils.h"
+#include "config.h"
 
 #ifdef _WIN32
 #include "fileutils.h"
@@ -22,38 +23,54 @@
 // HELPERS
 /////////////////////////////////////////////////////////////////////////////
 
-bool val_from_env ( const char* szEnvName, bool bDefault )
+[[nodiscard]] bool env_exists ( const char* szEnvName ) noexcept
 {
-	if ( getenv ( szEnvName ) )
-		return true;
-	return bDefault;
+	return getenv ( szEnvName )!=nullptr;
 }
 
-int val_from_env ( const char* szEnvName, int iDefault )
+[[nodiscard]] std::optional<bool> env_bool ( const char* szEnvName ) noexcept
 {
-	int iRes = iDefault;
 	const char* szEnv = getenv ( szEnvName );
-	if ( szEnv )
-	{
-		char* szEnd = nullptr;
-		iRes = strtol ( szEnv, &szEnd, 10 );
-		if ( *szEnd != '\0' )
-			sphWarning ( "%s expects to be numeric. %s provided, failed to parse as numeric since %s", szEnvName, szEnv, szEnd );
-	}
+	if (!szEnv)
+		return std::nullopt;
+
+	const auto sEnv = FromSz ( szEnv );
+
+	if ( StrEqN (sEnv,FROMS("true")) || StrEqN (sEnv,FROMS("yes")) || StrEqN (sEnv,FROMS("1")) )
+		return true;
+
+	if ( StrEqN (sEnv,FROMS("false")) || StrEqN (sEnv,FROMS("no")) || StrEqN (sEnv,FROMS("0")) )
+		return false;
+
+	sphWarning ( "%s expects to be boolean (true, false, yes, no, 1, or 0). %s provided, failed to parse as boolean", szEnvName, szEnv );
+	return std::nullopt;
+}
+
+[[nodiscard]] std::optional<long> env_long ( const char* szEnvName ) noexcept
+{
+	const char* szEnv = getenv ( szEnvName );
+	if (!szEnv)
+		return std::nullopt;
+
+	char* szEnd = nullptr;
+	auto iRes = ::strtol ( szEnv, &szEnd, 10 );
+	if ( *szEnd != '\0' )
+		sphWarning ( "%s expects to be numeric. %s provided, failed to parse as numeric since %s", szEnvName, szEnv, szEnd );
+
 	return iRes;
 }
 
-DWORD dwval_from_env ( const char* szEnvName, DWORD uDefault )
+[[nodiscard]] std::optional<unsigned long> env_ulong ( const char* szEnvName ) noexcept
 {
-	DWORD uRes = uDefault;
 	const char* szEnv = getenv ( szEnvName );
-	if ( szEnv )
-	{
-		char* szEnd = nullptr;
-		uRes = strtoul ( szEnv, &szEnd, 10 );
-		if ( *szEnd != '\0' )
-			sphWarning ( "%s expects to be numeric. %s provided, failed to parse as numeric since %s", szEnvName, szEnv, szEnd );
-	}
+	if (!szEnv)
+		return std::nullopt;
+
+	char* szEnd = nullptr;
+	auto uRes = ::strtoul ( szEnv, &szEnd, 10 );
+	if ( *szEnd != '\0' )
+		sphWarning ( "%s expects to be numeric. %s provided, failed to parse as numeric since %s", szEnvName, szEnv, szEnd );
+
 	return uRes;
 }
 
@@ -89,7 +106,7 @@ CSphString GET_GALERA_FULLPATH()
 	return sResult;
 }
 
-CSphString GET_COLUMNAR_FULLPATH()
+CSphString GetColumnarFullpath()
 {
 	CSphString sResult;
 	const char* szEnv = getenv ( "LIB_MANTICORE_COLUMNAR" );
@@ -97,10 +114,11 @@ CSphString GET_COLUMNAR_FULLPATH()
 		sResult = szEnv;
 	else
 		sResult.SetSprintf ( "%s/" LIB_MANTICORE_COLUMNAR, GET_MANTICORE_MODULES() );
+
 	return sResult;
 }
 
-CSphString GET_SECONDARY_FULLPATH()
+CSphString GetSecondaryFullpath()
 {
 	CSphString sResult;
 	const char* szEnv = getenv ( "LIB_MANTICORE_SECONDARY" );
@@ -108,40 +126,74 @@ CSphString GET_SECONDARY_FULLPATH()
 		sResult = szEnv;
 	else
 		sResult.SetSprintf ( "%s/" LIB_MANTICORE_SECONDARY, GET_MANTICORE_MODULES() );
+
 	return sResult;
 }
 
 
-CSphString GET_ICU_DATA_DIR()
+CSphString GetKNNFullpath()
 {
-	const char* szEnv = getenv ( "ICU_DATA_DIR" );
+	CSphString sResult;
+	const char* szEnv = getenv ( "LIB_MANTICORE_KNN" );
+	if ( szEnv )
+		sResult = szEnv;
+	else
+		sResult.SetSprintf ( "%s/" LIB_MANTICORE_KNN, GET_MANTICORE_MODULES() );
+
+	return sResult;
+}
+
+
+CSphString GetKNNEmbeddingsFullpath()
+{
+	CSphString sResult;
+	const char* szEnv = getenv ( "LIB_MANTICORE_KNN_EMBEDDINGS" );
+	if ( szEnv )
+		sResult = szEnv;
+	else
+		sResult.SetSprintf ( "%s/" LIB_MANTICORE_KNN_EMBEDDINGS, GET_MANTICORE_MODULES() );
+
+	return sResult;
+}
+
+
+static CSphString GetSegmentationDataPath ( const char * szEnvVar, const char * szDir, const char * szMask )
+{
+	const char* szEnv = getenv(szEnvVar);
 	if ( szEnv )
 		return szEnv;
 
 #ifdef _WIN32
 	CSphString sPathToExe = GetPathOnly ( GetExecutablePath() );
 	CSphString sPathToData;
-	sPathToData.SetSprintf ( "%s/../share/icu/", sPathToExe.cstr() );
+	sPathToData.SetSprintf ( "%s/../share/%s/", sPathToExe.cstr(), szDir );
 	sPathToData = sphNormalizePath ( sPathToData );
 
 	CSphString sSearch;
-	sSearch.SetSprintf ( "%s/icudt*.dat", sPathToData.cstr(), sPathToExe.cstr() );
+	sSearch.SetSprintf ( "%s/%s", sPathToData.cstr(), szMask );
 
 	StrVec_t dFiles = FindFiles ( sSearch.cstr(), false );
 	if ( dFiles.GetLength() )
 		return sPathToData;
 #endif
 
-	CSphString sModulesPrefix;
-	if ( sModulesPrefix.IsEmpty() )
-	{
-		CSphString sInitModulesPrefix;
-		sInitModulesPrefix.SetSprintf ( "%s/icu", GET_FULL_SHARE_DIR() );
-		sModulesPrefix.Swap ( sInitModulesPrefix );
-	}
-
-	return sModulesPrefix;
+	CSphString sInitModulesPrefix;
+	sInitModulesPrefix.SetSprintf ( "%s/%s", GET_FULL_SHARE_DIR(), szDir );
+	return sInitModulesPrefix;
 }
+
+
+CSphString GetICUDataDir()
+{
+	return GetSegmentationDataPath ( "ICU_DATA_DIR", "icu", "icudt*.dat" );
+}
+
+
+CSphString GetJiebaDataDir()
+{
+	return GetSegmentationDataPath ( "JIEBA_DATA_DIR", "jieba", "*.utf8" );
+}
+
 
 const char* GET_MANTICORE_MODULES()
 {

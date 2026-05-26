@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -14,7 +14,7 @@
 
 #include "sphinxsearch.h"
 
-void ISphQueryFilter::GetKeywords ( CSphVector<CSphKeywordInfo>& dKeywords, const ExpansionContext_t& tCtx )
+void ISphQueryFilter::GetKeywords ( CSphVector<CSphKeywordInfo> & dKeywords, ExpansionContext_t & tCtx )
 {
 	assert ( m_pTokenizer && m_pDict && m_pSettings );
 
@@ -26,7 +26,7 @@ void ISphQueryFilter::GetKeywords ( CSphVector<CSphKeywordInfo>& dKeywords, cons
 	CSphVector<int> dQposWildcards;
 
 	// FIXME!!! got rid of duplicated term stat and qword setup
-	while ( ( sWord = m_pTokenizer->GetToken() ) != NULL )
+	while ( ( sWord = m_pTokenizer->GetToken() ) )
 	{
 		if ( tCtx.m_iCutoff!=-1 && dKeywords.GetLength()>=tCtx.m_iCutoff )
 		{
@@ -50,12 +50,13 @@ void ISphQueryFilter::GetKeywords ( CSphVector<CSphKeywordInfo>& dKeywords, cons
 		const BYTE* sMultiform = m_pTokenizer->GetTokenizedMultiform();
 		strncpy ( (char*)sTokenized, sMultiform ? (const char*)sMultiform : (const char*)sWord, sizeof ( sTokenized ) - 1 );
 
-		if ( ( !m_tFoldSettings.m_bFoldWildcards || m_tFoldSettings.m_bStats ) && sphHasExpandableWildcards ( (const char*)sWord ) )
+		if ( tCtx.m_bAllowExpansion && ( !m_tFoldSettings.m_bFoldWildcards || m_tFoldSettings.m_bStats ) && sphHasExpandableWildcards ( (const char*)sWord ) )
 		{
 			dQposWildcards.Add ( iQpos );
 
-			ISphWordlist::Args_t tWordlist ( false, tCtx.m_iExpansionLimit, tCtx.m_bHasExactForms, tCtx.m_eHitless, tCtx.m_pIndexData );
+			ISphWordlist::Args_t tWordlist ( false, tCtx );
 			bool bExpanded = sphExpandGetWords ( (const char*)sWord, tCtx, tWordlist );
+			tCtx.m_bHasWildcards |= bExpanded;
 
 			int iDocs = 0;
 			int iHits = 0;
@@ -117,7 +118,7 @@ void ISphQueryFilter::GetKeywords ( CSphVector<CSphKeywordInfo>& dKeywords, cons
 	XQLimitSpec_t tSpec;
 	BYTE sTmp[3 * SPH_MAX_WORD_LEN + 4];
 	BYTE sTmp2[3 * SPH_MAX_WORD_LEN + 4];
-	CSphVector<XQNode_t*> dChildren ( 64 );
+	CSphVector<const XQNode_t*> dChildren ( 64 );
 
 	CSphBitvec tSkipTransform;
 	if ( dQposWildcards.GetLength() )
@@ -133,7 +134,7 @@ void ISphQueryFilter::GetKeywords ( CSphVector<CSphKeywordInfo>& dKeywords, cons
 		int iKeywordQpos = dKeywords[iTokenized].m_iQpos;
 
 		// do not transform expanded wild-cards
-		if ( !tSkipTransform.IsEmpty() && tSkipTransform.BitGet ( iKeywordQpos ) )
+		if ( tSkipTransform.BitGetOr ( iKeywordQpos ) )
 			continue;
 
 		// MUST copy as Dict::GetWordID changes word and might add symbols
@@ -141,68 +142,69 @@ void ISphQueryFilter::GetKeywords ( CSphVector<CSphKeywordInfo>& dKeywords, cons
 		int iPreAotCount = dKeywords.GetLength();
 
 		XQNode_t tAotNode ( tSpec );
-		tAotNode.m_dWords.Resize ( 1 );
-		tAotNode.m_dWords.Begin()->m_sWord = (char*)sTokenized;
+		XQKeyword_t dWord;
+		dWord.m_sWord = (char *) sTokenized;
+		tAotNode.AddDirtyWord ( std::move(dWord) );
 		TransformAotFilter ( &tAotNode, m_pDict->GetWordforms(), *m_pSettings );
 
 		dChildren.Resize ( 0 );
 		dChildren.Add ( &tAotNode );
 
 		// recursion unfolded
-		ARRAY_FOREACH ( iChild, dChildren )
+		ARRAY_FOREACH ( iChild, dChildren ) // notice dChildren.Add() below; ranged-for loop is not suitable
 		{
+			const XQNode_t * pChild = dChildren[iChild];
+
 			// process all words at node
-			ARRAY_FOREACH ( iAotKeyword, dChildren[iChild]->m_dWords )
+			for ( const auto& dAotKeyword: pChild->dWords() )
 			{
 				// MUST copy as Dict::GetWordID changes word and might add symbols
-				strncpy ( (char*)sTmp, dChildren[iChild]->m_dWords[iAotKeyword].m_sWord.scstr(), sizeof ( sTmp ) - 1 );
+				strncpy ( (char*)sTmp, dAotKeyword.m_sWord.scstr(), sizeof ( sTmp ) - 1 );
 				// prevent use-after-free-bug due to vector grow: AddKeywordsStats() calls dKeywords.Add()
 				strncpy ( (char*)sTmp2, dKeywords[iTokenized].m_sTokenized.scstr(), sizeof ( sTmp2 ) - 1 );
 				AddKeywordStats ( sTmp, sTmp2, iKeywordQpos, dKeywords );
 			}
 
 			// push all child nodes at node to process list
-			const XQNode_t* pChild = dChildren[iChild];
-			ARRAY_FOREACH ( iRec, pChild->m_dChildren )
-				dChildren.Add ( pChild->m_dChildren[iRec] );
+			for ( const XQNode_t* pGrand : pChild->dChildren() )
+				dChildren.Add ( pGrand );
 		}
 
-		bool bGotLemmas = ( iPreAotCount != dKeywords.GetLength() );
+		bool bGotLemmas = iPreAotCount != dKeywords.GetLength();
+		if ( !bGotLemmas )
+			continue;
 
 		// remove (replace) original word in case of AOT taken place
-		if ( bGotLemmas )
+		if ( !m_tFoldSettings.m_bFoldLemmas )
 		{
-			if ( !m_tFoldSettings.m_bFoldLemmas )
-			{
-				::Swap ( dKeywords[iTokenized], dKeywords.Last() );
-				dKeywords.Resize ( dKeywords.GetLength() - 1 );
-			} else
-			{
-				int iKeywordWithMaxHits = iPreAotCount;
-				for ( int i = iPreAotCount + 1; i < dKeywords.GetLength(); i++ )
-					if ( dKeywords[i].m_iHits > dKeywords[iKeywordWithMaxHits].m_iHits )
-						iKeywordWithMaxHits = i;
+			::Swap ( dKeywords[iTokenized], dKeywords.Last() );
+			dKeywords.Resize ( dKeywords.GetLength() - 1 );
+		} else
+		{
+			int iKeywordWithMaxHits = iPreAotCount;
+			for ( int i = iPreAotCount + 1; i < dKeywords.GetLength(); i++ )
+				if ( dKeywords[i].m_iHits > dKeywords[iKeywordWithMaxHits].m_iHits )
+					iKeywordWithMaxHits = i;
 
-				CSphString sNormalizedWithMaxHits = dKeywords[iKeywordWithMaxHits].m_sNormalized;
+			CSphString sNormalizedWithMaxHits = dKeywords[iKeywordWithMaxHits].m_sNormalized;
 
-				int iDocs = 0;
-				int iHits = 0;
-				if ( m_tFoldSettings.m_bStats )
+			int iDocs = 0;
+			int iHits = 0;
+			if ( m_tFoldSettings.m_bStats )
+			{
+				for ( int i = iPreAotCount; i < dKeywords.GetLength(); i++ )
 				{
-					for ( int i = iPreAotCount; i < dKeywords.GetLength(); i++ )
-					{
-						iDocs += dKeywords[i].m_iDocs;
-						iHits += dKeywords[i].m_iHits;
-					}
+					iDocs += dKeywords[i].m_iDocs;
+					iHits += dKeywords[i].m_iHits;
 				}
-				::Swap ( dKeywords[iTokenized], dKeywords[iPreAotCount] );
-				dKeywords.Resize ( iPreAotCount );
-				dKeywords[iTokenized].m_iDocs = iDocs;
-				dKeywords[iTokenized].m_iHits = iHits;
-				dKeywords[iTokenized].m_sNormalized = sNormalizedWithMaxHits;
-
-				RemoveDictSpecials ( dKeywords[iTokenized].m_sNormalized, ( m_pSettings->m_eBigramIndex!=SPH_BIGRAM_NONE ) );
 			}
+			::Swap ( dKeywords[iTokenized], dKeywords[iPreAotCount] );
+			dKeywords.Resize ( iPreAotCount );
+			dKeywords[iTokenized].m_iDocs = iDocs;
+			dKeywords[iTokenized].m_iHits = iHits;
+			dKeywords[iTokenized].m_sNormalized = sNormalizedWithMaxHits;
+
+			RemoveDictSpecials ( dKeywords[iTokenized].m_sNormalized, ( m_pSettings->m_eBigramIndex!=SPH_BIGRAM_NONE ) );
 		}
 	}
 
@@ -260,7 +262,7 @@ void UniqKeywords ( CSphVector<CSphKeywordInfo> & dSrc )
 	ARRAY_FOREACH ( i, dSrc )
 	{
 		const CSphKeywordInfo & tInfo = dSrc[i];
-		uint64_t uKey = sphFNV64 ( &tInfo.m_iQpos, sizeof(tInfo.m_iQpos) );
+		uint64_t uKey = sphFNV64 ( tInfo.m_iQpos );
 		uKey = sphFNV64 ( tInfo.m_sNormalized.cstr(), tInfo.m_sNormalized.Length(), uKey );
 
 		CSphKeywordInfo & tVal = hWords.AddUnique ( uKey );

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -11,7 +11,9 @@
 #include "jsonqueryfilter.h"
 
 #include "sphinxint.h"
+#include "geodist.h"
 #include <time.h>
+#include "datetime.h"
 
 static const char * g_szFilter = "_@filter_";
 
@@ -217,7 +219,7 @@ bool GeoDistInfo_c::ParseDistance ( const JsonObj_c & tDistance, CSphString & sE
 	m_fDistance = (float)atof ( sNumber.cstr() );
 
 	float fCoeff = 1.0f;	
-	if ( !sphGeoDistanceUnit ( sUnit.cstr(), fCoeff ) )
+	if ( !GeoDistanceUnit ( sUnit.cstr(), fCoeff ) )
 	{
 		sError.SetSprintf ( "unknown distance unit: %s", sUnit.cstr() );
 		return false;
@@ -280,7 +282,7 @@ static void AddToSelectList ( CSphQuery & tQuery, const CSphVector<CSphQueryItem
 
 static ESphAttr Json2AttrType ( const JsonObj_c & tJson )
 {
-	if ( tJson.IsInt() )	return SPH_ATTR_BIGINT;
+	if ( tJson.IsInt() || tJson.IsUint() )	return SPH_ATTR_BIGINT;
 	if ( tJson.IsDbl() )	return SPH_ATTR_FLOAT;
 	if ( tJson.IsBool() )	return SPH_ATTR_BOOL;
 	if ( tJson.IsStr() )	return SPH_ATTR_STRING;
@@ -413,6 +415,9 @@ bool FilterTreeConstructor_c::Parse ( const JsonObj_c & tObj )
 
 std::pair<bool, std::unique_ptr<FilterTreeNode_t>> FilterTreeConstructor_c::ConstructPlainFilters ( const JsonObj_c & tObj )
 {
+	if ( !CheckRootNode ( tObj, m_sError ) )
+		return { false, nullptr };
+
 	for ( const auto & tChild : tObj )
 		if ( IsFilter(tChild) )
 		{
@@ -462,7 +467,7 @@ std::pair<bool, std::unique_ptr<FilterTreeNode_t>> FilterTreeConstructor_c::Cons
 		}
 		else if ( sName=="must_not" )
 		{
-			std::tie ( bOk, pMustNotTreeRoot ) = ConstructBoolNodeFilters ( tClause, dMustNotQI, false );
+			std::tie ( bOk, pMustNotTreeRoot ) = ConstructBoolNodeFilters ( tClause, dMustNotQI, true );
 			if ( !bOk )
 				return { false, nullptr };
 		} else if ( sName=="filter" )
@@ -490,8 +495,16 @@ std::pair<bool, std::unique_ptr<FilterTreeNode_t>> FilterTreeConstructor_c::Cons
 
 	if ( pMustNotTreeRoot )
 	{
-		// fixme! this may not work as expected; better add a NOT node
-		WalkTree ( pMustNotTreeRoot, []( auto & pNode ) { if ( pNode->m_pFilter ) pNode->m_pFilter->m_bExclude = !pNode->m_pFilter->m_bExclude; } );
+		// also de morgan laws transform
+		// NOT (A AND B) > (NOT A) OR (NOT B)
+		// and NOT (A OR B) > (NOT A) AND (NOT B).
+		WalkTree ( pMustNotTreeRoot, []( auto & pNode )
+		{
+			if ( pNode->m_pFilter )
+				pNode->m_pFilter->m_bExclude = !pNode->m_pFilter->m_bExclude;
+			else
+				pNode->m_bOr = !pNode->m_bOr;
+		});
 
 		for ( auto & i : dMustNotQI )
 			dMustQI.Add(i);
@@ -577,6 +590,9 @@ std::pair<bool, std::unique_ptr<FilterTreeNode_t>> FilterTreeConstructor_c::Cons
 				if ( !pFilter )
 					return {false, nullptr};
 
+				// might be a list from range string with both lt(e) and gt(e) nodes
+				if ( pFilter->m_pRight )
+					dAdded.push_back ( std::move(pFilter->m_pRight) );
 				dAdded.push_back ( std::move(pFilter) );
 			}
 		}
@@ -825,7 +841,7 @@ std::unique_ptr<FilterTreeNode_t> FilterTreeConstructor_c::ConstructEqualsFilter
 	sphColumnToLowercase ( const_cast<char *>( tFilter.m_sAttrName.cstr() ) );
 	SetMvaFilterFunc ( tFilter );
 
-	if ( tColumn.IsInt() )
+	if ( tColumn.IsInt() || tColumn.IsUint() )
 	{
 		tFilter.m_eType = SPH_FILTER_VALUES;
 		tFilter.m_dValues.Add ( tColumn.IntVal() );
@@ -874,6 +890,32 @@ std::unique_ptr<FilterTreeNode_t> FilterTreeConstructor_c::ConstructEqualsFilter
 	return pFilterNode;
 }
 
+static void SetRangeStrLess ( const JsonObj_c & tLess, CSphFilterSettings & tFilter )
+{
+	tFilter.m_dStrings.Add ( tLess.StrVal() );
+	if ( tFilter.m_bHasEqualMax )
+	{
+		tFilter.m_eStrCmpDir = EStrCmpDir::GT;
+		tFilter.m_bExclude = true;
+	} else
+	{
+		tFilter.m_eStrCmpDir = EStrCmpDir::LT;
+	}
+}
+
+static void SetRangeStrGreater ( const JsonObj_c & tGreater, CSphFilterSettings & tFilter )
+{
+	tFilter.m_dStrings.Add ( tGreater.StrVal() );
+	tFilter.m_eStrCmpDir = EStrCmpDir::GT;
+	if ( tFilter.m_bHasEqualMin )
+	{
+		tFilter.m_eStrCmpDir = EStrCmpDir::LT;
+		tFilter.m_bExclude = true;
+	} else
+	{
+		tFilter.m_eStrCmpDir = EStrCmpDir::GT;
+	}
+}
 
 std::unique_ptr<FilterTreeNode_t> FilterTreeConstructor_c::ConstructRangeFilter ( const JsonObj_c & tJson )
 {
@@ -922,9 +964,9 @@ std::unique_ptr<FilterTreeNode_t> FilterTreeConstructor_c::ConstructRangeFilter 
 		if ( tDateFormat && tDateFormat.StrVal()=="strict_date_optional_time" )
 		{
 			if ( bLess )
-				iLessVal = GetUTC ( tLess.StrVal(), CompatDateFormat() );
+				iLessVal = GetUTC ( tLess.StrVal() );
 			if ( bGreater )
-				iGreaterVal = GetUTC ( tGreater.StrVal(), CompatDateFormat() );
+				iGreaterVal = GetUTC ( tGreater.StrVal() );
 		}
 
 		if ( ( bLess && iLessVal==-1 && tLess.IsStr() && tLess.SzVal() && strcmp ( tLess.SzVal(), "now" )==0 )
@@ -936,6 +978,29 @@ std::unique_ptr<FilterTreeNode_t> FilterTreeConstructor_c::ConstructRangeFilter 
 				iGreaterVal = (int) time ( nullptr );
 		}
 
+		// full string comparsion in range
+		if ( ( bLess && iLessVal==-1 ) || ( bGreater && iGreaterVal==-1) )
+		{
+			tFilter.m_eType = SPH_FILTER_STRING;
+			if ( bLess && bGreater )
+			{
+				auto pFilterNodeGt = std::make_unique<FilterTreeNode_t>();
+				pFilterNodeGt->m_pFilter = std::make_unique<CSphFilterSettings>( tFilter );
+				SetRangeStrLess ( tLess, tFilter );
+				SetRangeStrGreater ( tGreater, *pFilterNodeGt->m_pFilter );
+				pFilterNode->m_pRight = std::move ( pFilterNodeGt );
+			}
+			else if ( bLess )
+			{
+				SetRangeStrLess ( tLess, tFilter );
+			} else
+			{
+				SetRangeStrGreater ( tGreater, tFilter );
+			}
+
+			return pFilterNode;
+		}
+
 		if ( ( bLess && iLessVal==-1 ) || ( bGreater && iGreaterVal==-1) )
 		{
 			m_sError = "range filter expects numeric values";
@@ -943,13 +1008,13 @@ std::unique_ptr<FilterTreeNode_t> FilterTreeConstructor_c::ConstructRangeFilter 
 		}
 	} else
 	{
-		if ( bLess && tLess.IsInt() )
+		if ( bLess && ( tLess.IsInt() || tLess.IsUint() ) )
 			iLessVal = tLess.IntVal();
-		if ( bGreater && tGreater.IsInt() )
+		if ( bGreater && ( tGreater.IsInt() || tGreater.IsUint() ) )
 			iGreaterVal = tGreater.IntVal();
 	}
 
-	bool bIntFilter = ( ( !bLess || tLess.IsInt() || tLess.IsStr() ) && ( !bGreater || tGreater.IsInt() || tGreater.IsStr() ) );
+	bool bIntFilter = ( ( !bLess || tLess.IsInt() || tLess.IsUint() || tLess.IsStr() ) && ( !bGreater || tGreater.IsInt() || tGreater.IsUint() || tGreater.IsStr() ) );
 
 	if ( bLess )
 	{
@@ -1002,14 +1067,24 @@ static bool ConstructFilters ( const JsonObj_c & tJson, CSphQuery & tQuery, CSph
 	if ( sName.IsEmpty() )
 		return false;
 
-	if ( sName!="query" )
+	bool bKNN = sName=="knn";
+	if ( sName!="query" && !bKNN )
 	{
 		sError.SetSprintf ( R"("query" expected, got %s)", sName.cstr() );
 		return false;
 	}
 
+	// legacy: extract "filter" from the KNN object
+	JsonObj_c tKNNFilter;
+	if ( bKNN )
+	{
+		tKNNFilter = tJson.GetObjItem ( "filter", sError, true );
+		if ( !tKNNFilter )
+			return true;
+	}
+
 	FilterTreeConstructor_c tTreeConstructor ( tQuery, sError, sWarning );
-	return tTreeConstructor.Parse(tJson);
+	return tTreeConstructor.Parse ( bKNN ? tKNNFilter : tJson );
 }
 
 
@@ -1031,16 +1106,28 @@ bool ParseJsonQueryFilters ( const JsonObj_c & tJson, CSphQuery & tQuery, CSphSt
 	bool bFullscan = !tJson || ( tJson.Size()==1 && tJson.HasItem("match_all") );
 
 	if ( !bFullscan )
-		tQuery.m_sQuery = tJson.AsString();
+	{
+		// legacy: when called with the KNN object, extract "filter" child for the query string
+		if ( CSphString ( tJson.Name() )=="knn" )
+		{
+			JsonObj_c tFilter = tJson.GetObjItem ( "filter", sError, true );
+			if ( tFilter )
+			{
+				for ( auto & tKNN : tQuery.m_dKnnSettings )
+					tKNN.m_bPrefilter = true;
+
+				tQuery.m_sQuery = tFilter.AsString();
+			}
+		}
+		else
+			tQuery.m_sQuery = tJson.AsString();
+	}
 
 	// because of the way sphinxql parsing was implemented
 	// we need to parse our query and extract filters now
 	// and parse the rest of the query later
-	if ( tJson )
-	{
-		if ( !ConstructFilters ( tJson, tQuery, sError, sWarning ) )
-			return false;
-	}
+	if ( tJson && !ConstructFilters ( tJson, tQuery, sError, sWarning ) )
+		return false;
 
 	return true;
 }

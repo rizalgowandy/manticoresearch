@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2021-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2021-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -12,6 +12,7 @@
 #include "attribute.h"
 #include "sortcomp.h"
 #include "conversion.h"
+#include "knnmisc.h"
 
 
 class CompareSingleError_fn
@@ -1102,6 +1103,12 @@ static bool CanCreateColumnarSorter ( const ISphSchema & tSchema, const CSphMatc
 		const CSphColumnInfo & tAttr = tSchema.GetAttr(i);
 		if ( tAttr.m_eStage<=SPH_EVAL_PRESORT && tAttr.m_pExpr && sphIsDataPtrAttr ( tAttr.m_eAttrType ) )
 			return false;
+
+		if ( tAttr.IsJoined() )
+			return false;
+
+		if ( tAttr.m_sName==GetKnnDistRescoreAttrName() )
+			return false;
 	}
 
 	bool bHaveColumnar = false;
@@ -1237,8 +1244,6 @@ ISphMatchSorter * CreateColumnarProxySorter ( ISphMatchSorter * pSorter, int iMa
 	switch ( eSortFunc )
 	{
 	case FUNC_REL_DESC:		return CreateProxySorter<MatchRelevanceLt_fn>	( pSorter, iMaxMatches, tSchema, tState, iSortFastPath, bAllInt, bAllFloat );
-	case FUNC_ATTR_DESC:	return CreateProxySorter<MatchAttrLt_fn>		( pSorter, iMaxMatches, tSchema, tState, iSortFastPath, bAllInt, bAllFloat );
-	case FUNC_ATTR_ASC:		return CreateProxySorter<MatchAttrGt_fn>		( pSorter, iMaxMatches, tSchema, tState, iSortFastPath, bAllInt, bAllFloat );
 	case FUNC_TIMESEGS:		return CreateProxySorter<MatchTimeSegments_fn>	( pSorter, iMaxMatches, tSchema, tState, iSortFastPath, bAllInt, bAllFloat );
 	case FUNC_GENERIC1:		return CreateProxySorter<MatchGeneric1_fn>		( pSorter, iMaxMatches, tSchema, tState, iSortFastPath, bAllInt, bAllFloat );
 	case FUNC_GENERIC2:		return CreateProxySorter<MatchGeneric2_fn>		( pSorter, iMaxMatches, tSchema, tState, iSortFastPath, bAllInt, bAllFloat );

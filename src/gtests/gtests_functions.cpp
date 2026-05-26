@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -20,6 +20,7 @@
 #include "histogram.h"
 #include "conversion.h"
 #include "digest_sha1.h"
+#include "std/openhash.h"
 
 // Miscelaneous short functional tests: TDigest, SpanSearch,
 // stringbuilder, CJson, TaggedHash, Log2
@@ -34,10 +35,11 @@ protected:
 	void SetUp() override
 	{
 		sphSrand ( 0 );
-		pDigest = sphCreateTDigest ();
+		pDigest = &tDigest;
 	}
 
-	std::unique_ptr<TDigest_i> pDigest;
+	TDigest_c tDigest;
+	TDigest_c* pDigest;
 };
 
 TEST_F ( TDigest, simple )
@@ -105,8 +107,7 @@ TEST ( Misc, SpanSearch )
 TEST( functions, TaggedHash20_t )
 {
 	const char * sFIPS = "45f44fd2db02b08b4189abf21e90edd712c9616d *rt_full.ram\n";
-	const BYTE bytescheck[HASH20_SIZE] = { 0x45, 0xf4, 0x4f, 0xd2, 0xdb, 0x02, 0xb0, 0x8b, 0x41, 0x89, 0xab, 0xf2
-										   , 0x1e, 0x90, 0xed, 0xd7, 0x12, 0xc9, 0x61, 0x6d };
+	const HASH20_t bytescheck { 0x45, 0xf4, 0x4f, 0xd2, 0xdb, 0x02, 0xb0, 0x8b, 0x41, 0x89, 0xab, 0xf2, 0x1e, 0x90, 0xed, 0xd7, 0x12, 0xc9, 0x61, 0x6d };
 	const char * namecheck = "rt_full.ram";
 
 	TaggedHash20_t tHash ( "HelloFips" );
@@ -117,7 +118,7 @@ TEST( functions, TaggedHash20_t )
 	tHash.FromFIPS ( sFIPS );
 	ASSERT_TRUE ( tHash.m_sTagName==namecheck );
 
-	ASSERT_TRUE ( 0==memcmp ( tHash.m_dHashValue, bytescheck, HASH20_SIZE ) );
+	ASSERT_EQ ( tHash.m_dHashValue, bytescheck );
 
 	sFips = tHash.ToFIPS ();
 	ASSERT_TRUE ( sFips==sFIPS );
@@ -599,7 +600,7 @@ TEST ( functions, OneshotAutoEvent )
 TEST ( functions, Hash_simple )
 {
 	// add and verify a couple keys manually
-	OpenHash_T<int, int64_t, HashFunc_Int64_t> h;
+	OpenHashTable_T<int64_t, int> h;
 	int &a = h.Acquire ( 123 );
 	ASSERT_FALSE ( a );
 	a = 1;
@@ -663,7 +664,7 @@ TEST ( functions, HASH_randomized )
 
 // big randomized test
 {
-	OpenHash_T<int, int64_t, HashFunc_Int64_t> h;
+	OpenHashTable_T<int64_t, int> h;
 	const int NVALS = 996146; // 0.95f out of 1M
 
 	// add N numbers
@@ -1822,7 +1823,7 @@ int iCompared;
 int make_partition (DWORD iPivot, int iNeedElems, VecTraits_T<DWORD> dData )
 {
 //	printf ( "iPivot=%d, need %d, has %d\n", iPivot, iNeedElems, dData.GetLength() );
-	int iPass = 0;
+//	int iPass = 0;
 	auto cmp = Lesser ( [] ( int a, int b ) {
 		++iCompared;
 		return a>b;
@@ -1863,7 +1864,7 @@ int make_partition (DWORD iPivot, int iNeedElems, VecTraits_T<DWORD> dData )
 //		iPivot = dData[(a+b)/2];
 		iPivot = dData[( a*3+b ) / 4]; // ( a*(COEF-1)+b)/COEF
 //		printf ( "a=%d, b=%d, pivot=%d\n", a,b,iPivot );
-		++iPass;
+//		++iPass;
 	}
 
 //	printf ( "partitioning completed in %d passes, %d comparisions, new pivot %d\n", iPass, iCompared, iPivot );
@@ -2098,6 +2099,35 @@ TEST ( functions, histogram )
 	}
 }
 
+TEST ( functions, histogram_expression )
+{
+	CSphColumnInfo tCol;
+	CSphSchema tSchema;
+	tCol.m_sName = "price";
+	tCol.m_eAttrType = SPH_ATTR_FLOAT;
+	tSchema.AddAttr ( tCol, false );
+
+	auto * pRow = new CSphRowitem[tSchema.GetRowSize ()];
+
+	CSphMatch tMatch;
+	tMatch.m_tRowID = 1;
+	tMatch.m_pStatic = pRow;
+
+	CSphString sError;
+	ExprParseArgs_t tExprArgs;
+	ISphExprRefPtr_c pExpr ( sphExprParse ( "histogram(price*100, {hist_interval=1})", tSchema, sError, tExprArgs ) );
+	ASSERT_TRUE ( pExpr.Ptr () ) << sError.cstr();
+
+	sphSetRowAttr ( pRow, tSchema.GetAttr(0).m_tLocator, sphF2DW ( 0.5f ) );
+	EXPECT_EQ ( 50, pExpr->IntEval ( tMatch ) );
+
+	tMatch.m_tRowID = 2;
+	sphSetRowAttr ( pRow, tSchema.GetAttr(0).m_tLocator, sphF2DW ( 0.75f ) );
+	EXPECT_EQ ( 75, pExpr->IntEval ( tMatch ) );
+
+	SafeDeleteArray ( pRow );
+}
+
 TEST ( functions, field_mask )
 {
 	FieldMask_t foo;
@@ -2240,4 +2270,28 @@ TEST ( functions, mutate_via_ref )
 	ASSERT_EQ ( ( *refData )[3], 42 );
 	ASSERT_EQ ( refData->GetRefcount (), 1 );
 
+}
+
+TEST ( functions, openhash_iterations )
+{
+	OpenHashTable_T<uint64_t, int, IdentityHash_fn> hHash;
+	hHash.Add ( 1, 10 );
+	hHash.Add ( 2, 20 );
+	hHash.Add ( 3, 30 );
+	auto I = hHash.begin();
+	ASSERT_EQ(I->first,1);
+	ASSERT_TRUE (I->second!=nullptr);
+	ASSERT_EQ(*I->second,10);
+	++I;
+	ASSERT_EQ(I->first,2);
+	ASSERT_TRUE (I->second!=nullptr);
+	ASSERT_EQ(*I->second,20);
+	++I;
+	ASSERT_EQ(I->first,3);
+	ASSERT_TRUE (I->second!=nullptr);
+	ASSERT_EQ(*I->second,30);
+	++I;
+	ASSERT_EQ(I->first,0);
+	ASSERT_TRUE (I->second==nullptr);
+	ASSERT_EQ(I, hHash.end());
 }

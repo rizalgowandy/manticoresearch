@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -31,14 +31,14 @@ struct FieldBlob_t
 	CSphVector<FieldLoc_t>	m_dLocs;
 };
 
-struct DocHash_t : private OpenHash_T<int, DocID_t>
+struct DocHash_t : private OpenHashTable_T<DocID_t, int>
 {
-	explicit DocHash_t ( int iElems ) : OpenHash_T<int, DocID_t> { iElems } {}
+	explicit DocHash_t ( int iElems ) : OpenHashTable_T<DocID_t,int> { iElems } {}
 	int Count () const { return (int)GetLength(); }
 	bool Exists ( DocID_t tId ) const { return ( Find ( tId )!=nullptr ); }
 	void Set ( DocID_t tId, int iOff ) { Acquire ( tId ) = iOff;}
-	using OpenHash_T<int, DocID_t>::Acquire;
-	using OpenHash_T<int, DocID_t>::Find;
+	using OpenHashTable_T<DocID_t,int>::Acquire;
+	using OpenHashTable_T<DocID_t,int>::Find;
 };
 
 struct ResLoc_t
@@ -137,6 +137,8 @@ bool GetIndexes ( const CSphString & sIndexes, CSphString & sError, StrVec_t & d
 	StrVec_t dNames;
 	ParseIndexList ( sIndexes, dNames );
 
+	sph::StringSet hDups;
+
 	for ( const CSphString & sIndex : dNames )
 	{
 		auto pLocal = GetServed ( sIndex );
@@ -150,28 +152,32 @@ bool GetIndexes ( const CSphString & sIndexes, CSphString & sError, StrVec_t & d
 
 		if ( pLocal )
 		{
-			dLocal.Add ( sIndex );
+			if ( hDups.Add ( sIndex ) )
+				dLocal.Add ( sIndex );
+
 		} else
 		{
 			for ( const auto& pAgent : pDist->m_dAgents )
 			{
 				auto * pConn = new AgentConn_t;
 				pConn->SetMultiAgent ( pAgent );
-				pConn->m_iMyConnectTimeoutMs = pDist->m_iAgentConnectTimeoutMs;
-				pConn->m_iMyQueryTimeoutMs = pDist->m_iAgentQueryTimeoutMs;
+				pConn->m_iMyConnectTimeoutMs = pDist->GetAgentConnectTimeoutMs();
+				pConn->m_iMyQueryTimeoutMs = pDist->GetAgentQueryTimeoutMs();
 				pConn->m_pResult = std::make_unique<RemoteFieldsAnswer_t>();
 				dRemotes.Add ( pConn );
 			}
-			dLocal.Append ( pDist->m_dLocal );
+			for ( const auto & sDistLocal : pDist->m_dLocal )
+			{
+				if ( hDups.Add ( sDistLocal ) )
+					dLocal.Add ( sDistLocal );
+			}
 		}
 	}
 
-	dLocal.Uniq();
 	return true;
 }
 
-bool GetFieldFromLocal ( const CSphString & sIndexName, const FieldRequest_t & tArgs, int64_t iSessionID,
-		DocHash_t & hFetchedDocs, FieldBlob_t & tRes )
+static bool GetFieldFromLocal ( const CSphString & sIndexName, const FieldRequest_t & tArgs, int64_t iSessionID, DocHash_t & hFetchedDocs, FieldBlob_t & tRes )
 {
 	auto pServed = GetServed ( sIndexName );
 	if ( !pServed )
@@ -179,6 +185,8 @@ bool GetFieldFromLocal ( const CSphString & sIndexName, const FieldRequest_t & t
 		tRes.m_sError.SetSprintf ( "no such table %s", sIndexName.cstr() );
 		return false;
 	}
+
+	pServed->m_pStats->IncCmd ( SEARCHD_COMMAND_GETFIELD );
 
 	auto& tRefCrashQuery = GlobalCrashQueryGetRef();
 	tRefCrashQuery.m_dIndex = { sIndexName.cstr(), sIndexName.Length() };
@@ -275,7 +283,7 @@ bool GetFieldFromDist ( VecRefPtrsAgentConn_t & dRemotes, const FieldRequest_t &
 	return true;
 }
 
-bool GetFields ( const FieldRequest_t & tReq, FieldBlob_t & tRes, DocHash_t & hFetchedDocs )
+static bool GetFields ( const FieldRequest_t & tReq, FieldBlob_t & tRes, DocHash_t & hFetchedDocs )
 {
 	if ( tReq.m_dDocs.IsEmpty() )
 		return true;
@@ -346,10 +354,9 @@ FieldRequest_t ParseAPICommandGetfield ( InputBuffer_c & tReq )
 }
 
 void SendAPICommandGetfieldAnswer ( ISphOutputBuffer & tOut, FieldRequest_t& tRequest,
-		const FieldBlob_t& tRes, const DocHash_t& _tFetched )
+		const FieldBlob_t& tRes, const DocHash_t& tFetched )
 {
 	auto tReply = APIAnswer ( tOut, VER_COMMAND_GETFIELD );
-	auto & tFetched = const_cast<DocHash_t &>(_tFetched); // non-const need for Acquire()
 	auto iDocsCount = tFetched.Count();
 	if ( !iDocsCount )
 	{
@@ -361,24 +368,30 @@ void SendAPICommandGetfieldAnswer ( ISphOutputBuffer & tOut, FieldRequest_t& tRe
 
 	auto& dDocs = tRequest.m_dDocs;
 
-	// send doclist and simultaneously wipe out absend docs
-	// note that because of wiping doc's order will be broken!
+	// wipe out absent docs
+	ARRAY_FOREACH ( i, dDocs )
+		if ( !tFetched.Exists ( dDocs[i] ) )
+			dDocs.RemoveFast ( i-- );
+
+	if ( iDocsCount != dDocs.GetLength() )
+		dDocs.Uniq();
+
+	assert ( iDocsCount==dDocs.GetLength () );
 	tOut.SendDword ( iDocsCount );
 	ARRAY_FOREACH ( i, dDocs )
 	{
-		if ( tFetched.Exists ( dDocs[i] ) )
-			tOut.SendUint64 ( dDocs[i] );
-		else
-			dDocs.RemoveFast(i--);
+		assert ( tFetched.Exists ( dDocs[i] ) );
+		tOut.SendUint64 ( dDocs[i] );
 	}
-
-	assert ( iDocsCount==dDocs.GetLength () );
 
 	auto iFields = tRequest.m_dFieldNames.GetLength ();
 	tOut.SendDword ( iDocsCount * iFields );
 	for ( DocID_t tDoc : dDocs )
 	{
-		int iOff = tFetched.Acquire ( tDoc );
+		auto pDoc = tFetched.Find ( tDoc );
+		if (!pDoc)
+			continue;
+		const int iOff = *pDoc;
 		for ( int i=0; i<iFields; ++i )
 		{
 			tOut.SendDword ( tRes.m_dLocs[iOff+i].m_iOff );
@@ -387,6 +400,14 @@ void SendAPICommandGetfieldAnswer ( ISphOutputBuffer & tOut, FieldRequest_t& tRe
 	}
 
 	tOut.SendArray ( tRes.m_dBlob );
+}
+
+int GetDocIDOffset ( const AggrResult_t& tRes )
+{
+	const CSphColumnInfo* pId = tRes.m_tSchema.GetAttr ( sphGetDocidName() );
+	if ( pId )
+		return pId->m_tLocator.m_iBitOffset >> ROWITEM_SHIFT;
+	return 0;
 }
 
 // fill vec of ResLoc_t with remote matches from tRes, sorted by DocID
@@ -399,11 +420,12 @@ int CollectUntaggedDocs ( CSphVector<ResLoc_t>& dIds, const AggrResult_t & tRes,
 
 	DocID_t iLastDocID = DOCID_MIN;
 	bool bNeedSort = false;
+	auto iIdOffset = GetDocIDOffset ( tRes );
 	ARRAY_CONSTFOREACH( i, dMatches )
 	{
 		const CSphMatch & tMatch = dMatches[i];
 		ResLoc_t & tDoc = dIds.Add ();
-		tDoc.m_iDocid = sphGetDocID ( tMatch.m_pDynamic );
+		tDoc.m_iDocid = sphGetDocID ( tMatch.m_pDynamic + iIdOffset );
 		tDoc.m_iIndex = i;
 		if ( bNeedSort )
 			continue;
@@ -426,13 +448,14 @@ void CollectTaggedDocs ( CSphVector<ResLoc_t> & dIds, const AggrResult_t & tRes,
 {
 	assert ( tRes.m_bTagsAssigned );
 	assert ( tRes.m_bSingle );
+	auto iIdOffset = GetDocIDOffset ( tRes );
 	ARRAY_CONSTFOREACH( i, dMatches )
 	{
 		const CSphMatch & tMatch = dMatches[i];
 		if ( !tRes.m_dResults[tMatch.m_iTag].m_bTag ) // process only matches came from remotes
 			continue;
 		ResLoc_t & tDoc = dIds.Add ();
-		tDoc.m_iDocid = sphGetDocID ( tMatch.m_pDynamic );
+		tDoc.m_iDocid = sphGetDocID ( tMatch.m_pDynamic + iIdOffset );
 		tDoc.m_iIndex = i;
 	}
 	dIds.Sort ( Lesser ( [&dMatches] ( const ResLoc_t & a, const ResLoc_t & b )

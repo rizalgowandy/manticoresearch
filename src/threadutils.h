@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -77,10 +77,13 @@ struct LowThreadDesc_t
 	CSphString			m_sThreadName;
 	std::atomic<void *>	m_pTaskInfo;	///< what kind of task I'm doing now (nullptr - idle, i.e. nothing)
 	std::atomic<void *> m_pHazards;		///< my hazard pointers
+	void *				m_pWorker = nullptr;	///< my coro worker (m.b. empty in generic threads)
+	StringBuilder_c		m_sThreadMsg;
+	std::atomic<StringBuilder_c*> m_pTlsMsg { &m_sThreadMsg };
 };
 
 // thread-local description available globaly from any thread
-LowThreadDesc_t& MyThd ();
+LowThreadDesc_t& MyThd () noexcept;
 
 // save name from my local LowThreadDesc into OS thread name
 void SetSysThreadName();
@@ -126,45 +129,52 @@ struct Scheduler_i
 {
 	virtual ~Scheduler_i() = default;
 
-	virtual void ScheduleOp ( Threads::details::SchedulerOperation_t* pOp, bool bVip ) = 0;
-	virtual void ScheduleContinuationOp ( Threads::details::SchedulerOperation_t* pOp ) // if task already started
+	virtual void ScheduleOp ( Threads::details::SchedulerOperation_t* pOp, bool bVip ) noexcept = 0;
+	virtual void ScheduleContinuationOp ( Threads::details::SchedulerOperation_t* pOp ) noexcept // if task already started
 	{
 		ScheduleOp ( pOp, false );
 	}
 	// RAII keeper of scheduler (when it exists, scheduler will not finish). That is necessary, say, if the only work is
 	// paused and moved somewhere (for example, as cb in epoll polling). Without keeper scheduler then finish and it will
 	// be impossible to resume it later.
-	virtual Keeper_t KeepWorking() = 0;
+	virtual Keeper_t KeepWorking() noexcept = 0;
 
 	// number of parallel contextes might be necessary when working via this scheduler
 	// alone and strand obviously has 1 worker; threadpool has many.
-	virtual int WorkingThreads() const
+	virtual int WorkingThreads() const noexcept
 	{
 		return 1;
 	};
-	virtual const char* Name() const
+	virtual const char* Name() const noexcept
 	{
 		return "unnamed_sched";
 	}
 
 	template<typename HANDLER>
-	void Schedule ( HANDLER handler, bool bVip );
+	void Schedule ( HANDLER handler, bool bVip ) noexcept;
 
 	template<typename HANDLER>
-	void ScheduleContinuation ( HANDLER handler );
+	void ScheduleContinuation ( HANDLER handler ) noexcept;
 };
 
 struct SchedulerWithBackend_i: public Scheduler_i
 {
-	virtual bool SetBackend ( Scheduler_i* pBackend ) = 0;
+	virtual bool SetBackend ( Scheduler_i* pBackend ) noexcept = 0;
+};
+
+struct NTasks_t { // snapshot length of Op queue
+	int iPri;
+	int iSec;
 };
 
 struct Worker_i: public Scheduler_i
 {
 	virtual int Works() const = 0;
+	virtual NTasks_t Tasks() const noexcept = 0;
+	virtual int CurTasks() const noexcept = 0;
 	virtual void StopAll () = 0;
 	virtual void DiscardOnFork() {}
-	virtual void IterateChildren ( ThreadFN & fnHandler ) {}
+	virtual void IterateChildren ( ThreadFN & fnHandler ) noexcept {}
 };
 
 using SchedulerSharedPtr_t = SharedPtr_t<Scheduler_i>;
@@ -242,21 +252,12 @@ Handler WithCopiedCrashQuery ( Handler fnHandler );
 
 extern ThreadRole MainThread;
 
-
-namespace CrashLogger
-{
-#if !_WIN32
-	void HandleCrash( int );
-#else
-	LONG WINAPI HandleCrash ( EXCEPTION_POINTERS * pExc );
-#endif
-	void SetupTimePID();
-};
-
 // Scheduler to global thread pool
 Threads::Worker_i* GlobalWorkPool ();
 void SetMaxChildrenThreads ( int iThreads );
+int MaxChildrenThreads() noexcept;
 void StartGlobalWorkPool ();
+void StopGlobalWorkPool();
 
 /// schedule stop of the global thread pool
 void WipeGlobalSchedulerOnShutdownAndFork ();
@@ -289,6 +290,10 @@ namespace searchd
 // send them SIGTERM on shutdown
 namespace Detached
 {
+	using ShutdownNotifierFn = void (*) () noexcept;
+
+	void SetNotifier ( ShutdownNotifierFn fnNotifier ) noexcept;
+
 	void AddThread ( Threads::LowThreadDesc_t* pThread );
 
 	void RemoveThread ( Threads::LowThreadDesc_t* pThread );

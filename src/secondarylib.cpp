@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2020-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2020-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -11,64 +11,42 @@
 
 #include "sphinxutils.h"
 #include "libutils.h"
-#include "fileutils.h"
-#include "schema/columninfo.h"
-#include "schema/schema.h"
-#include "columnarmisc.h"
 #include "secondarylib.h"
-#include "std/cpuid.h"
+#include "std/env.h"
+#include "std/sys.h"
 
+namespace sec {
 using CheckStorage_fn =			void (*) ( const std::string & sFilename, uint32_t uNumRows, std::function<void (const char*)> & fnError, std::function<void (const char*)> & fnProgress );
 using VersionStr_fn =			const char * (*)();
 using GetVersion_fn	=			int (*)();
-using CreateSI_fn =				SI::Index_i * (*) ( const char * sFile, std::string & sError );
-using CreateBuilder_fn =		SI::Builder_i *	(*) ( const SI::Settings_t & tSettings, const common::Schema_t & tSchema, int iMemoryLimit, const std::string & sFile, std::string & sError );
+using CreateSI_fn =				SI::Index_i * (*) ( const char * sFile, const SI::IndexSettings_t & tSettings, std::string & sError );
+using CreateBuilder_fn =		SI::Builder_i *	(*) ( const common::Schema_t & tSchema, size_t tMemoryLimit, const std::string & sFile, size_t tBufferSize, std::string & sError );
+}
 
 static void *					g_pSecondaryLib = nullptr;
-static VersionStr_fn			g_fnVersionStr = nullptr;
-static GetVersion_fn			g_fnStorageVersion  = nullptr;
-static CreateSI_fn				g_fnCreateSI  = nullptr;
-static CreateBuilder_fn			g_fnCreateBuilder  = nullptr;
+static sec::VersionStr_fn		g_fnVersionSecStr = nullptr;
+static sec::CreateSI_fn			g_fnCreateSI = nullptr;
+static sec::CreateBuilder_fn	g_fnCreateBuilder = nullptr;
+
+static uint64_t					g_uBlockCacheSize = 8*1024*1024;
 
 /////////////////////////////////////////////////////////////////////
 
 #if HAVE_DLOPEN
-template <typename T>
-static bool LoadFunc ( T & pFunc, void * pHandle, const char * szFunc, const CSphString & sLib, CSphString & sError )
-{
-	pFunc = (T) dlsym ( pHandle, szFunc );
-	if ( !pFunc )
-	{
-		sError.SetSprintf ( "symbol '%s' not found in '%s'", szFunc, sLib.cstr() );
-		dlclose ( pHandle );
-		return false;
-	}
-
-	return true;
-}
-
-static CSphString TryDifferentPaths ( const CSphString & sLibfile )
-{
-	CSphString sPath = GET_SECONDARY_FULLPATH();
-	if ( sphFileExists ( sPath.cstr() ) )
-		return sPath;
-
-#if _WIN32
-	CSphString sPathToExe = GetPathOnly ( GetExecutablePath() );
-	sPath.SetSprintf ( "%s%s", sPathToExe.cstr(), sLibfile.cstr() );
-	if ( sphFileExists ( sPath.cstr() ) )
-		return sPath;
-#endif
-
-	return "";
-}
-
-
 bool InitSecondary ( CSphString & sError )
 {
 	assert ( !g_pSecondaryLib );
 
-	CSphString sLibfile = TryDifferentPaths ( LIB_MANTICORE_SECONDARY );
+	CSphString sLibfile;
+	if ( IsAVX512Supported() )
+		sLibfile = TryDifferentPaths ( LIB_MANTICORE_SECONDARY, GetSecondaryFullpath(), SI::LIB_VERSION, "_avx512" );
+
+	if ( sLibfile.IsEmpty() && IsAVX2Supported() )
+		sLibfile = TryDifferentPaths ( LIB_MANTICORE_SECONDARY, GetSecondaryFullpath(), SI::LIB_VERSION, "_avx2" );
+
+	if ( sLibfile.IsEmpty() )
+		sLibfile = TryDifferentPaths ( LIB_MANTICORE_SECONDARY, GetSecondaryFullpath(), SI::LIB_VERSION );
+
 	if ( sLibfile.IsEmpty() )
 		return true;
 
@@ -88,7 +66,7 @@ bool InitSecondary ( CSphString & sError )
 
 	sphLogDebug ( "dlopen(%s)=%p", sLibfile.cstr(), tHandle.Get() );
 
-	GetVersion_fn fnGetVersion;
+	sec::GetVersion_fn fnGetVersion;
 	if ( !LoadFunc ( fnGetVersion, tHandle.Get(), "GetSecondaryLibVersion", sLibfile, sError ) )
 		return false;
 
@@ -99,8 +77,7 @@ bool InitSecondary ( CSphString & sError )
 		return false;
 	}
 
-	if ( !LoadFunc ( g_fnVersionStr, tHandle.Get(), "GetSecondaryLibVersionStr", sLibfile, sError ) )				return false;
-	if ( !LoadFunc ( g_fnStorageVersion, tHandle.Get(), "GetSecondaryStorageVersion", sLibfile, sError ) )			return false;
+	if ( !LoadFunc ( g_fnVersionSecStr, tHandle.Get(), "GetSecondaryLibVersionStr", sLibfile, sError ) )				return false;
 	if ( !LoadFunc ( g_fnCreateSI, tHandle.Get(), "CreateSecondaryIndex", sLibfile, sError ) )						return false;
 	if ( !LoadFunc ( g_fnCreateBuilder, tHandle.Get(), "CreateBuilder", sLibfile, sError ) )						return false;
 
@@ -132,18 +109,8 @@ const char * GetSecondaryVersionStr()
 	if ( !IsSecondaryLibLoaded() )
 		return nullptr;
 
-	assert ( g_fnVersionStr );
-	return g_fnVersionStr();
-}
-
-
-int GetSecondaryStorageVersion()
-{
-	if ( !IsSecondaryLibLoaded() )
-		return -1;
-
-	assert ( g_fnStorageVersion );
-	return g_fnStorageVersion();
+	assert ( g_fnVersionSecStr );
+	return g_fnVersionSecStr();
 }
 
 
@@ -152,7 +119,20 @@ bool IsSecondaryLibLoaded()
 	return !!g_pSecondaryLib;
 }
 
-SI::Index_i * CreateSecondaryIndex ( const char * sFile, CSphString & sError )
+
+void SetSIBlockCacheSize ( uint64_t uSize )
+{
+	g_uBlockCacheSize = uSize;
+}
+
+
+uint64_t GetSIBlockCacheSize()
+{
+	return g_uBlockCacheSize;
+}
+
+
+SI::Index_i * CreateSecondaryIndex ( const char * szFile, CSphString & sError )
 {
 	if ( !IsSecondaryLibLoaded() )
 	{
@@ -162,15 +142,17 @@ SI::Index_i * CreateSecondaryIndex ( const char * sFile, CSphString & sError )
 
 	assert ( g_fnCreateSI );
 
+	SI::IndexSettings_t tSettings { .m_uBlockCacheSize = g_uBlockCacheSize };
+
 	std::string sTmpError;
-	SI::Index_i * pSIdx = g_fnCreateSI ( sFile, sTmpError );
+	SI::Index_i * pSIdx = g_fnCreateSI ( szFile, tSettings, sTmpError );
 	if ( !pSIdx )
 		sError = sTmpError.c_str();
 
 	return pSIdx;
 }
 
-std::unique_ptr<SI::Builder_i> CreateSecondaryIndexBuilder ( const common::Schema_t & tSchema, int iMemoryLimit, const CSphString & sFile, CSphString & sError )
+std::unique_ptr<SI::Builder_i> CreateSecondaryIndexBuilder ( const common::Schema_t & tSchema, int64_t iMemoryLimit, const CSphString & sFile, int iBufferSize, CSphString & sError )
 {
 	if ( !IsSecondaryLibLoaded() )
 	{
@@ -181,8 +163,7 @@ std::unique_ptr<SI::Builder_i> CreateSecondaryIndexBuilder ( const common::Schem
 	assert ( g_fnCreateBuilder );
 
 	std::string sTmpError;
-	SI::Settings_t tSettings; // FIXME! use config?
-	std::unique_ptr<SI::Builder_i> pBuilder { g_fnCreateBuilder ( tSettings, tSchema, iMemoryLimit, sFile.cstr(), sTmpError ) };
+	std::unique_ptr<SI::Builder_i> pBuilder { g_fnCreateBuilder ( tSchema, iMemoryLimit, sFile.cstr(), iBufferSize, sTmpError ) };
 	if ( !pBuilder )
 		sError = sTmpError.c_str();
 

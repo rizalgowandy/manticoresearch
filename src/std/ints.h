@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -12,16 +12,14 @@
 
 #pragma once
 
-#include "config.h"
-
-#include <stdio.h>
+// #include <cstdio>
 
 // for 64-bit types
-#if HAVE_STDINT_H
-#include <stdint.h>
+#if __has_include(<cstdint>)
+#include <cstdint>
 #endif
 
-#if HAVE_SYS_TYPES_H
+#if __has_include(<sys/types.h>)
 #include <sys/types.h>
 #endif
 
@@ -49,12 +47,11 @@
 #define NOMINMAX
 #include <windows.h>
 
-#define strcasecmp strcmpi
-#define strncasecmp _strnicmp
-#define snprintf _snprintf
-#define strtoll _strtoi64
-#define strtoull _strtoui64
-
+inline int strcasecmp (char const* sz1, char const* sz2) { return strcmpi(sz1,sz2); }
+inline int strncasecmp (char const* sz1, char const* sz2, size_t n) { return _strnicmp(sz1,sz2,n); }
+#if _MSC_VER < 1900
+	#define snprintf _snprintf
+#endif
 #else
 
 	using DWORD = unsigned int;

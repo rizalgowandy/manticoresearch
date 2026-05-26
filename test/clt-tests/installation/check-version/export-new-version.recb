@@ -1,0 +1,25 @@
+––– input –––
+export new_version_searchd=$(searchd --version | head -n 1 | cut -d" " -f2); echo $new_version_searchd
+––– output –––
+%{VERSION}
+––– input –––
+export new_version_columnar=$(searchd --version | sed -n 's/.*columnar \([^ )]*\).*/\1/p'); echo $new_version_columnar
+––– output –––
+%{VERSION}
+––– input –––
+export new_version_secondary=$(searchd --version | sed -n 's/.*secondary \([^ )]*\).*/\1/p'); echo $new_version_secondary
+––– output –––
+%{VERSION}
+––– input –––
+export new_version_knn=$(searchd --version | sed -n 's/.*knn \([^ )]*\).*/\1/p'); echo $new_version_knn
+––– output –––
+%{VERSION}
+––– input –––
+export new_version_galera=$(strings /usr/share/manticore/modules/libgalera_manticore.so | grep -oE '[0-9]+\.[0-9]+' | head -n1); echo $new_version_galera
+––– output –––
+#!/[0-9]+\.[0-9]+/!#
+––– input –––
+export new_version_buddy=$(mysql -h0 -P9306 -e "SHOW STATUS LIKE 'version'\G" 2>/dev/null | grep -oP 'buddy v\K[^ )]+'); echo $new_version_buddy
+––– output –––
+#!/[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}\+[0-9]{8}-[0-9a-z]{8}.*/!#
+

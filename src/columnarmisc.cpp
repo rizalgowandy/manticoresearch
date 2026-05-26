@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2021-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2021-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -39,11 +39,13 @@ SphAttr_t SetColumnarAttr ( int iAttr, ESphAttr eType, columnar::Builder_i * pBu
 	{
 	case SPH_ATTR_UINT32SET:
 	case SPH_ATTR_INT64SET:
+	case SPH_ATTR_FLOAT_VECTOR:
 	{
 		const BYTE * pResult = nullptr;
 		int iBytes = pIterator->Get ( tRowID, pResult );
-		int iValues = iBytes / ( eType==SPH_ATTR_UINT32SET ? sizeof(DWORD) : sizeof(int64_t) );
-		if ( eType==SPH_ATTR_UINT32SET )
+		bool b32Bits = eType==SPH_ATTR_UINT32SET || eType==SPH_ATTR_FLOAT_VECTOR;
+		int iValues = iBytes / (  b32Bits ? sizeof(DWORD) : sizeof(int64_t) );
+		if ( b32Bits )
 		{
 			// need a 64-bit array as input. so we need to convert our 32-bit array to 64-bit entries
 			dTmp.Resize(iValues);
@@ -77,9 +79,9 @@ SphAttr_t SetColumnarAttr ( int iAttr, ESphAttr eType, columnar::Builder_i * pBu
 }
 
 
-void SetDefaultColumnarAttr ( int iAttr, ESphAttr eType, columnar::Builder_i * pBuilder )
+void SetDefaultColumnarAttr ( int iAttr, const CSphColumnInfo & tAttr, columnar::Builder_i * pBuilder, CSphVector<int64_t> & dTmp )
 {
-	switch ( eType )
+	switch ( tAttr.m_eAttrType )
 	{
 	case SPH_ATTR_UINT32SET:
 	case SPH_ATTR_INT64SET:
@@ -90,10 +92,51 @@ void SetDefaultColumnarAttr ( int iAttr, ESphAttr eType, columnar::Builder_i * p
 		pBuilder->SetAttr ( iAttr, (const uint8_t *)0, 0 );
 		break;
 
+	case SPH_ATTR_FLOAT_VECTOR:
+		if ( tAttr.IsIndexedKNN() )
+		{
+			dTmp.Resize ( tAttr.m_tKNN.m_iDims );
+			dTmp.ZeroVec();
+			pBuilder->SetAttr ( iAttr, dTmp.Begin(), dTmp.GetLength() );
+		}
+		else
+			pBuilder->SetAttr ( iAttr, (const uint8_t *)0, 0 );
+		break;
+
 	default:
 		pBuilder->SetAttr ( iAttr, 0 );
 		break;
 	}
+}
+
+
+CSphString ColumnarAttrType2Str ( common::AttrType_e eType )
+{
+	switch ( eType )
+	{
+	case common::AttrType_e::NONE:		return "none";
+	case common::AttrType_e::UINT32:	return "uint32";
+	case common::AttrType_e::TIMESTAMP:	return "timestamp";
+	case common::AttrType_e::INT64:		return "int64";
+	case common::AttrType_e::UINT64:	return "uint64";
+	case common::AttrType_e::BOOLEAN:	return "boolean";
+	case common::AttrType_e::FLOAT:		return "float";
+	case common::AttrType_e::STRING:	return "string";
+	case common::AttrType_e::UINT32SET:	return "uint32set";
+	case common::AttrType_e::INT64SET:	return "int64set";
+	case common::AttrType_e::FLOATVEC:	return "floatvec";
+	default:							return "unknown";
+	}
+}
+
+
+PlainOrColumnar_t::PlainOrColumnar_t ( const CSphColumnInfo & tAttr, int iColumnar )
+{
+	m_eType = tAttr.m_eAttrType;
+	if ( tAttr.IsColumnar() )
+		m_iColumnarId = iColumnar;
+	else
+		m_tLocator = tAttr.m_tLocator;
 }
 
 

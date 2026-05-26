@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -15,7 +15,7 @@
 #include "sphinxint.h"
 #include "fileutils.h"
 #include "sphinxutils.h"
-#include "sphinxstem.h"
+#include "dict/stem/sphinxstem.h"
 #include "stripper/html_stripper.h"
 #include <cmath>
 
@@ -93,7 +93,8 @@ static int ProxyLevenshtein ( const char * sA, const char * sB )
 {
 	auto iLenA = (int) strlen ( sA );
 	auto iLenB = (int) strlen ( sB );
-	return sphLevenshtein ( sA, iLenA, sB, iLenB );
+	CSphVector<int> dTmp;
+	return sphLevenshtein ( sA, iLenA, sB, iLenB, dTmp );
 }
 
 TEST ( Text, Levenshtein )
@@ -576,6 +577,20 @@ TEST ( Text, ArabicStemmer )
 		memcpy ( dTest22.Begin () + iOff, sTest2, sizeof ( sTest2 ) );
 		stem_ar_utf8 ( dTest22.Begin () + iOff );
 		ASSERT_FALSE ( memcmp ( dTest22.Begin () + iOff, sRef2, sizeof ( sRef2 ) ) );
+	}
+
+	const char * dMixedTests[] =
+	{
+		u8"ال200د",
+		u8"ال200ددد",
+	};
+
+	for ( const auto * sMixed : dMixedTests )
+	{
+		char sBuf[64];
+		snprintf ( sBuf, sizeof ( sBuf ), "%s", sMixed );
+		stem_ar_utf8 ( ( BYTE * ) sBuf );
+		ASSERT_STREQ ( sBuf, sMixed );
 	}
 }
 

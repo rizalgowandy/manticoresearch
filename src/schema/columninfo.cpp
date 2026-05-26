@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -17,7 +17,6 @@
 #include "indexing_sources/source_stats.h"
 #include "match.h"
 
-
 CSphColumnInfo::CSphColumnInfo ( const char* sName, ESphAttr eType )
 	: m_sName ( sName )
 	, m_eAttrType ( eType )
@@ -30,6 +29,7 @@ bool CSphColumnInfo::operator== ( const CSphColumnInfo & rhs ) const
 {
 	return m_sName == rhs.m_sName
 		&& m_eAttrType == rhs.m_eAttrType
+		&& m_eAggrInputType == rhs.m_eAggrInputType
 		&& m_tLocator.m_iBitCount == rhs.m_tLocator.m_iBitCount
 		&& m_tLocator.m_iBitOffset == rhs.m_tLocator.m_iBitOffset
 		&& m_tLocator.m_bDynamic == rhs.m_tLocator.m_bDynamic;
@@ -44,13 +44,13 @@ bool CSphColumnInfo::IsDataPtr() const
 
 bool CSphColumnInfo::IsColumnar() const
 {
-	return m_uAttrFlags & ATTR_COLUMNAR;
+	return !!(m_uAttrFlags & ATTR_COLUMNAR);
 }
 
 
 bool CSphColumnInfo::HasStringHashes() const
 {
-	return m_uAttrFlags & ATTR_COLUMNAR_HASHES;
+	return !!(m_uAttrFlags & ATTR_COLUMNAR_HASHES);
 }
 
 
@@ -63,6 +63,30 @@ bool CSphColumnInfo::IsColumnarExpr() const
 bool CSphColumnInfo::IsStoredExpr() const
 {
 	return m_pExpr.Ptr() && m_pExpr->IsStored();
+}
+
+
+bool CSphColumnInfo::IsIndexedKNN() const
+{
+	return !!(m_uAttrFlags & ATTR_INDEXED_KNN);
+}
+
+
+bool CSphColumnInfo::IsJoined() const
+{
+	return !!(m_uAttrFlags & ATTR_JOINED);
+}
+
+
+bool CSphColumnInfo::IsIndexedSI() const
+{
+	return !!(m_uAttrFlags & ATTR_INDEXED_SI);
+}
+
+
+bool CSphColumnInfo::IsStored() const
+{
+	return !!(m_uAttrFlags & CSphColumnInfo::ATTR_STORED);
 }
 
 

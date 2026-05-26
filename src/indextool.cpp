@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -22,6 +22,8 @@
 #include "tokenizer/charset_definition_parser.h"
 #include "indexcheck.h"
 #include "secondarylib.h"
+#include "knnlib.h"
+#include "detail/indexlink.h"
 
 #include <ctime>
 
@@ -401,6 +403,8 @@ static bool BuildIDF ( const CSphString & sFilename, const StrVec_t & dFiles, CS
 	// write data
 	tWriter.PutBytes ( dEntries.Begin(), dEntries.GetLength()*sizeof(IDFWord_t) );
 
+	tWriter.CloseFile();
+
 	int tmWallMsec = (int)( ( sphMicroTimer() - tmStart )/1000 );
 	fprintf ( stdout, "finished in %d.%d sec\n", tmWallMsec/1000, (tmWallMsec/100)%10 );
 
@@ -532,6 +536,8 @@ static bool MergeIDF ( const CSphString & sFilename, const StrVec_t & dFiles, CS
 		if ( bEnd )
 			break;
 	}
+
+	tWriter.CloseFile ();
 
 	ARRAY_FOREACH ( i, dFiles )
 		SafeDeleteArray ( dBuffers[i] );
@@ -871,7 +877,7 @@ static void ApplyKilllists ( CSphConfig & hConf )
 
 		IndexInfo_t & tIndex = dIndexes[iIndex++];
 		tIndex.m_sName = tIndex_.first.cstr();
-		tIndex.m_sPath = hIndex["path"].cstr();
+		tIndex.m_sPath = RedirectToRealPath ( hIndex["path"].strval() );
 
 		IndexFiles_c tIndexFiles ( tIndex.m_sPath, tIndex.m_sName.cstr () );
 
@@ -976,6 +982,26 @@ static void ApplyKilllists ( CSphConfig & hConf )
 }
 
 
+static void DumpIndexKilllist ( CSphIndex * pIndex )
+{
+	CSphString sError;
+	IndexInfo_t tIndex;
+	if ( !pIndex->LoadKillList ( &tIndex.m_dKilllist, tIndex.m_tTargets, sError ) )
+	{
+		fprintf ( stdout, "WARNING: unable to load kill-list for table %s: %s\n", tIndex.m_sName.cstr(), sError.cstr() );
+		return;
+	}
+
+	fprintf ( stdout, "killlist targets (%d entries):\n", tIndex.m_tTargets.m_dTargets.GetLength() );
+	for ( const auto & i : tIndex.m_tTargets.m_dTargets )
+		fprintf ( stdout, "\tindex: %s\tflags: %u\n", i.m_sIndex.cstr(), i.m_uFlags );
+
+	fprintf ( stdout, "killlist (%d entries):\n", tIndex.m_dKilllist.GetLength() );
+	for ( const auto & i : tIndex.m_dKilllist )
+		fprintf ( stdout, "\t" INT64_FMT "\n", i );
+}
+
+
 static void ShowVersion()
 {
 	const char * szColumnarVer = GetColumnarVersionStr();
@@ -1016,6 +1042,8 @@ Commands are:
 --dumphitlist <TABLE> <KEYWORD>
 --dumphitlist <TABLE> --wordid <ID>
 				dump hits for a given keyword
+--dumpkilllist <SPK-FILE>	dump killlist by file name
+--dumpkilllist <TABLE>		dump killlist by table name
 --docextract TBL DOCID		runs usual table check pass of whole dictionary/docs/hits,
 				and collects all the words and hits belonging to requested document.
 				Then all of the words are placed in the order according to their fields
@@ -1023,8 +1051,8 @@ Commands are:
 
 --fold <TABLE> [FILE]		fold FILE or stdin using TABLE charset_table
 --htmlstrip <TABLE>		filter stdin using table HTML stripper settings
---buildidf <TABLE1.dict> [TABLE2.dict ...] [--skip-uniq] --out <GLOBAL.idf>
-				join --stats dictionary dumps into global.idf file
+--buildidf <DICTFILE1.txt> [DICTFILE2.txt ...] [--skip-uniq] --out <GLOBAL.idf>
+				join --dumpdict dictionary dumps into global.idf file
 --mergeidf <NODE1.idf> [NODE2.idf ...] [--skip-uniq] --out <GLOBAL.idf>
 				merge several .idf files into one file
 --apply-killlists		apply table killlists
@@ -1048,6 +1076,7 @@ enum class IndextoolCmd_e
 	DUMPDOCIDS,
 	DUMPHITLIST,
 	DUMPDICT,
+	DUMPKLIST,
 	CHECK,
 	EXTRACT,
 	STRIP,
@@ -1060,8 +1089,7 @@ enum class IndextoolCmd_e
 };
 
 static IndextoolCmd_e g_eCommand = IndextoolCmd_e::NOTHING;
-static const char * g_sCommands[] = {"", "dumpheader", "dumpconfig", "dumpdocids", "dumphitlist", "dumpdict",
-	"check", "htmlstrip", "morph", "buildidf", "mergeidf", "checkconfig", "fold", "apply-killlists" };
+static const char * g_sCommands[] = {"", "dumpheader", "dumpconfig", "dumpdocids", "dumphitlist", "dumpdict", "dumpkilllist", "check", "htmlstrip", "morph", "buildidf", "mergeidf", "checkconfig", "fold", "apply-killlists" };
 
 
 static void SetCmd ( IndextoolCmd_e eCmd )
@@ -1189,7 +1217,7 @@ static std::unique_ptr<CSphIndex> CreateIndex ( CSphConfig & hConf, CSphString s
 	} else
 	{
 		StringBuilder_c tPath;
-		tPath << hIndex["path"] << ( bRotate ? ".tmp" : nullptr );
+		tPath << RedirectToRealPath ( hIndex["path"].strval() ) << ( bRotate ? ".tmp" : nullptr );
 		return sphCreateIndexPhrase ( std::move ( sIndex ), (CSphString)tPath );
 	}
 
@@ -1198,6 +1226,7 @@ static std::unique_ptr<CSphIndex> CreateIndex ( CSphConfig & hConf, CSphString s
 
 static void PreallocIndex ( const char * szIndex, bool bStripPath, CSphIndex * pIndex )
 {
+	SetIndexFilenameBuilder ( CreateFilenameBuilder );
 	std::unique_ptr<FilenameBuilder_i> pFilenameBuilder = CreateFilenameBuilder ( szIndex );
 	StrVec_t dWarnings;
 	if ( !pIndex->Prealloc ( bStripPath, pFilenameBuilder.get(), dWarnings ) )
@@ -1207,16 +1236,37 @@ static void PreallocIndex ( const char * szIndex, bool bStripPath, CSphIndex * p
 		fprintf ( stdout, "WARNING: table %s: %s\n", szIndex, i.cstr() );
 }
 
+static void Init()
+{
+	// threads should be initialized before memory allocations
+	char cTopOfMainStack;
+	Threads::Init();
+	Threads::PrepareMainThread ( &cTopOfMainStack );
+	auto iThreads = GetNumLogicalCPUs();
+	//		iThreads = 1; // uncomment if want to run all coro tests in single thread
+	SetMaxChildrenThreads ( iThreads );
+	StartGlobalWorkPool();
+	WipeGlobalSchedulerOnShutdownAndFork();
+}
+
 int main ( int argc, char ** argv )
 {
-	CSphString sError, sErrorSI;
+	Init();
+	AT_SCOPE_EXIT ( []() { StopGlobalWorkPool(); });
+
+	CSphString sError, sErrorSI, sErrorKNN;
 	bool bColumnarError = !InitColumnar ( sError );
 	bool bSecondaryError = !InitSecondary ( sErrorSI );
+	bool bKNNError = !InitKNN ( sErrorKNN );
 
 	if ( bColumnarError )
 		fprintf ( stdout, "Error initializing columnar storage: %s", sError.cstr() );
+
 	if ( bSecondaryError )
 		fprintf ( stdout, "Error initializing secondary index: %s", sErrorSI.cstr() );
+
+	if ( bKNNError )
+		fprintf ( stdout, "Error initializing knn index: %s", sErrorKNN.cstr() );
 
 	if ( argc<=1 )
 	{
@@ -1240,13 +1290,14 @@ int main ( int argc, char ** argv )
 	CSphString sOut;
 	bool bStats = false;
 	bool bSkipUnique = false;
-	CSphString sDumpDict;
+	CSphString sDumpDict, sDumpKlist;
 	bool bTraceToStdout = true;
 	bool bRotate = false;
 	bool bCheckIdDups = false;
 	int iCheckChunk = -1;
 	DocID_t iExtractDocid = -1;
 
+	const char* szErrorMsgTmpl = "ERROR: malformed or unknown option near '%s'.\n";
 	int i;
 	for ( i=1; i<argc; i++ )
 	{
@@ -1260,6 +1311,41 @@ int main ( int argc, char ** argv )
 		OPT ( "-h", "--help" )		{ ShowVersion(); ShowHelp(); exit(0); }
 		OPT1 ( "--apply-killlists" ){ SetCmd ( IndextoolCmd_e::APPLYKLISTS ); continue; }
 		OPT1 ( "--check-id-dups" )	{ bCheckIdDups = true; continue; }
+		if ( !strcmp ( argv[i], "--buildidf" ) || !strcmp ( argv[i], "--mergeidf" ) )
+		{
+			if ( !strcmp ( argv[i], "--buildidf" ) )
+			{
+				szErrorMsgTmpl = "USAGE: %s <DICTFILE1.txt> [DICTFILE2.txt ...] [--skip-uniq] --out <NODEGLOBAL.idf>\n";
+				SetCmd ( IndextoolCmd_e::BUILDIDF );
+			} else {
+				szErrorMsgTmpl = "USAGE: %s <NODE1.idf> [NODE2.idf ...] [--skip-uniq] --out <GLOBAL.idf>\n";
+				SetCmd ( IndextoolCmd_e::MERGEIDF );
+			}
+			if ( ( i + 1 ) >= argc )
+				break;
+			while ( ++i < argc )
+			{
+				if ( !strcmp ( argv[i], "--out" ) )
+				{
+					if ( ( i + 1 ) >= argc )
+						break; // too few args
+					sOut = argv[++i];
+
+				} else if ( !strcmp ( argv[i], "--skip-uniq" ) )
+				{
+					bSkipUnique = true;
+
+				} else if ( argv[i][0] == '-' )
+				{
+					break; // unknown switch
+
+				} else
+				{
+					dFiles.Add ( argv[i] ); // handle everything else as a file name
+				}
+			}
+			break;
+		}
 
 		// handle options/commands with 1+ args
 		if ( (i+1)>=argc )			break;
@@ -1291,6 +1377,11 @@ int main ( int argc, char ** argv )
 		{
 			iCheckChunk = (int)strtoll ( argv[++i], NULL, 10 ); continue;
 		}
+		OPT1 ( "--dumpkilllist" )
+		{
+			SetCmd ( IndextoolCmd_e::DUMPKLIST );
+			sDumpKlist = argv[++i];
+		}
 
 		// options with 2 args
 		else if ( ( i + 2 ) >= argc ) // NOLINT
@@ -1314,32 +1405,6 @@ int main ( int argc, char ** argv )
 
 			sKeyword = argv[++i];
 
-		} else if ( !strcmp ( argv[i], "--buildidf" ) || !strcmp ( argv[i], "--mergeidf" ) )
-		{
-			SetCmd ( !strcmp ( argv[i], "--buildidf" ) ? IndextoolCmd_e::BUILDIDF : IndextoolCmd_e::MERGEIDF );
-			while ( ++i<argc )
-			{
-				if ( !strcmp ( argv[i], "--out" ) )
-				{
-					if ( (i+1)>=argc )
-						break; // too few args
-					sOut = argv[++i];
-
-				} else if ( !strcmp ( argv[i], "--skip-uniq" ) )
-				{
-					bSkipUnique = true;
-
-				} else if ( argv[i][0]=='-' )
-				{
-					break; // unknown switch
-
-				} else
-				{
-					dFiles.Add ( argv[i] ); // handle everything else as a file name
-				}
-			}
-			break;
-
 		} else
 		{
 			// unknown option
@@ -1352,7 +1417,7 @@ int main ( int argc, char ** argv )
 
 	if ( i!=argc )
 	{
-		fprintf ( stdout, "ERROR: malformed or unknown option near '%s'.\n", argv[i] );
+		fprintf ( stdout, szErrorMsgTmpl, argv[i] );
 		return 1;
 	}
 
@@ -1366,6 +1431,21 @@ int main ( int argc, char ** argv )
 	sphCollationInit ();
 	SetupLemmatizerBase();
 
+
+// buildidf/mergeidf doesn't need config file at all
+	switch ( g_eCommand ) {
+	case IndextoolCmd_e::BUILDIDF:
+		if ( !BuildIDF ( sOut, dFiles, sError, bSkipUnique ) )
+			sphDie ( "ERROR: %s\n", sError.cstr() );
+		return 0;
+
+	case IndextoolCmd_e::MERGEIDF:
+		if ( !MergeIDF ( sOut, dFiles, sError, bSkipUnique ) )
+			sphDie ( "ERROR: %s\n", sError.cstr() );
+		return 0;
+	default: break;
+	};
+
 	auto hConf = sphLoadConfigWithoutIndexes ( sOptConfig, bTraceToStdout );
 
 	// can't reuse the code from searchdconfig, using a simplified version here
@@ -1375,18 +1455,27 @@ int main ( int argc, char ** argv )
 	if ( !hConf ( "index" ) )
 		sphDie ( "no tables found in config file '%s'", sOptConfig );
 
-	while (true)
+	switch ( g_eCommand )
 	{
-		if ( g_eCommand==IndextoolCmd_e::DUMPHEADER && sDumpHeader.Ends ( ".meta" ) )
+	case IndextoolCmd_e::DUMPHEADER:
+		if ( sDumpHeader.Ends ( ".meta" ) )
 		{
 			InfoMeta ( sDumpHeader );
 			return 0;
 		}
+		break;
 
-		if ( g_eCommand==IndextoolCmd_e::DUMPDICT && !sDumpDict.Ends ( ".spi" ) )
+	case IndextoolCmd_e::DUMPDICT:
+		if ( !sDumpDict.Ends ( ".spi" ) )
 			sIndex = sDumpDict;
 
 		break;
+
+	case IndextoolCmd_e::DUMPKLIST:
+		if ( !sDumpKlist.Ends ( ".spk" ) )
+			sIndex = sDumpKlist;
+
+	default: break;
 	}
 
 	///////////
@@ -1479,12 +1568,14 @@ int main ( int argc, char ** argv )
 		if ( !pIndex )
 			sphDie ( "table '%s': failed to create (%s)", sIndex.cstr(), sError.cstr() );
 
-		pIndex->SetDebugCheck ( bCheckIdDups, iCheckChunk );
+		if ( g_eCommand!=IndextoolCmd_e::DUMPDOCIDS && g_eCommand!=IndextoolCmd_e::DUMPDICT )
+			pIndex->SetDebugCheck ( bCheckIdDups, iCheckChunk );
 
+		Threads::CallCoroutine ( [&] {
 		PreallocIndex ( sIndex.cstr(), bStripPath, pIndex.get() );
 
 		if ( g_eCommand==IndextoolCmd_e::MORPH )
-			break;
+			return;
 
 		if ( !(g_eCommand==IndextoolCmd_e::CHECK || g_eCommand==IndextoolCmd_e::EXTRACT ))
 			pIndex->Preread();
@@ -1505,6 +1596,7 @@ int main ( int argc, char ** argv )
 
 			pIndex->Setup ( tSettings );
 		}
+		});
 
 		break;
 	}
@@ -1530,7 +1622,7 @@ int main ( int argc, char ** argv )
 					sphDie ( "missing 'path' for table '%s'\n", sDumpHeader.cstr() );
 
 				sIndexName = sDumpHeader;
-				sDumpHeader.SetSprintf ( "%s.sph", hConf["index"][sDumpHeader]["path"].cstr() );
+				sDumpHeader.SetSprintf ( "%s.sph", RedirectToRealPath ( hConf["index"][sDumpHeader]["path"].strval() ).cstr() );
 			} else
 				fprintf ( stdout, "dumping header file '%s'...\n", sDumpHeader.cstr() );
 
@@ -1570,27 +1662,46 @@ int main ( int argc, char ** argv )
 
 				pIndex->Preread();
 			} else
+			{
 				fprintf ( stdout, "dumping dictionary for table '%s'...\n", sIndex.cstr() );
+			}
 
 			if ( bStats )
 				fprintf ( stdout, "total-documents: " INT64_FMT "\n", pIndex->GetStats().m_iTotalDocuments );
-			pIndex->DebugDumpDict ( stdout );
+			pIndex->DebugDumpDict ( stdout, false );
 			break;
 		}
+
+		case IndextoolCmd_e::DUMPKLIST:
+			if ( sDumpKlist.Ends ( ".spk" ) )
+			{
+				fprintf ( stdout, "dumping killlist file '%s'...\n", sDumpKlist.cstr() );
+
+				sIndex = sDumpKlist.SubString ( 0, sDumpKlist.Length()-4 );
+				pIndex = sphCreateIndexPhrase ( sIndex, sIndex );
+
+				if ( !pIndex )
+					sphDie ( "table '%s': failed to create (%s)", sIndex.cstr(), sError.cstr() );
+			}
+			else
+				fprintf ( stdout, "dumping killlist for table '%s'...\n", sIndex.cstr() );
+
+			DumpIndexKilllist ( pIndex.get() );
+			break;
 
 		case IndextoolCmd_e::CHECK:
 		case IndextoolCmd_e::EXTRACT:
 			fprintf ( stdout, "checking table '%s'...\n", sIndex.cstr() );
 			{
 			std::unique_ptr<DebugCheckError_i> pReporter { MakeDebugCheckError ( stdout, ( g_eCommand == IndextoolCmd_e::CHECK ? nullptr : &iExtractDocid ) ) };
-				iCheckErrno = pIndex->DebugCheck ( *pReporter );
+				iCheckErrno = pIndex->DebugCheck ( *pReporter, nullptr );
 			}
 			if ( iCheckErrno )
 				return iCheckErrno;
 			if ( bRotate )
 			{
 				pIndex->Dealloc();
-				sNewIndex.SetSprintf ( "%s.new", hConf["index"][sIndex]["path"].cstr() );
+				sNewIndex.SetSprintf ( "%s.new", RedirectToRealPath ( hConf["index"][sIndex]["path"].strval() ).cstr() );
 				if ( !pIndex->Rename ( sNewIndex ) )
 					sphDie ( "table '%s': rotate failed: %s\n", sIndex.cstr(), pIndex->GetLastError().cstr() );
 			}
@@ -1607,16 +1718,6 @@ int main ( int argc, char ** argv )
 
 		case IndextoolCmd_e::MORPH:
 			ApplyMorphology ( pIndex.get() );
-			break;
-
-		case IndextoolCmd_e::BUILDIDF:
-			if ( !BuildIDF ( sOut, dFiles, sError, bSkipUnique ) )
-				sphDie ( "ERROR: %s\n", sError.cstr() );
-			break;
-
-		case IndextoolCmd_e::MERGEIDF:
-			if ( !MergeIDF ( sOut, dFiles, sError, bSkipUnique ) )
-				sphDie ( "ERROR: %s\n", sError.cstr() );
 			break;
 
 		case IndextoolCmd_e::FOLD:
@@ -1638,7 +1739,13 @@ int main ( int argc, char ** argv )
 			sphDie ( "INTERNAL ERROR: unhandled command (id=%d)", (int)g_eCommand );
 	}
 
+	Threads::CallCoroutine ( [&] {
+		pIndex = nullptr; // need to reset index prior to release of the libraries
+	});
+
 	ShutdownColumnar();
+	ShutdownSecondary();
+	ShutdownKNN();
 
 	return 0;
 }

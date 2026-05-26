@@ -1,0 +1,14 @@
+––– input –––
+sed -i -e '/listen = 127.0.0.1:9312/d' -e '/listen = 127.0.0.1:9308:http/d' /etc/manticoresearch/manticore.conf
+––– output –––
+––– input –––
+stdbuf -oL searchd > /dev/null
+––– output –––
+––– input –––
+if timeout 10 grep -qm1 'accepting connections' <(tail -n 1000 -f /var/log/manticore/searchd.log); then echo 'Accepting connections!'; else echo 'Timeout or failed!'; fi
+––– output –––
+Accepting connections!
+––– input –––
+mysql -h0 -P9306 -e "create cluster c"
+––– output –––
+ERROR 1064 (42000) at line 1: can not create cluster 'c': no 'listen' is found, cannot set incoming addresses, replication is disabled

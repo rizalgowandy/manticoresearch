@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -13,6 +13,7 @@
 #include "threadutils.h"
 #include <boost/context/detail/prefetch.hpp>
 #include <optional>
+#include "datetime.h"
 
 #if !_WIN32
 // UNIX-specific headers and calls
@@ -106,7 +107,6 @@ int GetOsProcessId()
 #include "event.h"
 
 #include <atomic>
-#include <optional>
 
 //////////////////////////////////////////////////////////////////////////
 /// functional threadpool with minimum footprint
@@ -181,7 +181,7 @@ public:
 		}
 
 		// Find the next context with the same key.
-		Value * NextByKey () const
+		Value * NextByKey () const noexcept
 		{
 			for ( auto* pElem = m_pNext; pElem!=nullptr; pElem = pElem->m_pNext )
 				if ( pElem->m_pService==m_pService )
@@ -194,7 +194,7 @@ public:
 
 	// Determine whether the specified owner is on the stack.
 	// Returns address of key, if present, nullptr otherwise.
-	static Value * Contains ( Key * pKey )
+	static Value * Contains ( Key * pKey ) noexcept
 	{
 		for ( auto* pElem = m_pTop; pElem!=nullptr; pElem = pElem->m_pNext )
 			if ( pElem->m_pService==pKey )
@@ -203,7 +203,7 @@ public:
 	}
 
 	// Obtain the value at the top of the stack.
-	static Value * Top ()
+	static Value * Top () noexcept
 	{
 		Context_c * pElem = m_pTop;
 		return pElem ? pElem->m_pThisContext : nullptr;
@@ -240,8 +240,8 @@ struct Service_t : public TaskService_t//, public Service_i
 	bool m_bStopped = false;                	/// dispatcher has been stopped.
 	bool m_bOneThread;                			/// optimize for single-threaded use case
 	sph::Event_c m_tWakeupEvent;				/// event to wake up blocked threads
-	OpSchedule_t m_OpQueue;						/// The queue of handlers that are ready to be delivered
-	OpSchedule_t m_OpVipQueue;					/// The queue of handlers that have to be delivered BEFORE OpQueue
+	OpSchedule_t m_OpQueue GUARDED_BY ( m_dMutex );		/// The queue of handlers that are ready to be delivered
+	OpSchedule_t m_OpVipQueue GUARDED_BY ( m_dMutex );	/// The queue of handlers that have to be delivered BEFORE OpQueue
 
 	// Per-thread call stack to track the state of each thread in the service.
 	using ThreadCallStack_c = CallStack_c<Service_t, TaskServiceThreadInfo_t>;
@@ -305,7 +305,7 @@ public:
 		wake_one_thread_and_unlock ( dLock );
 	}
 
-	void run () NO_THREAD_SAFETY_ANALYSIS //override
+	void run ( std::atomic<bool>& bBusy ) NO_THREAD_SAFETY_ANALYSIS //override
 	{
 		LOG ( SERVICE, SVC ) << "run " << m_iOutstandingWork << " st:" << !!m_bStopped;
 		if ( m_iOutstandingWork==0 )
@@ -320,7 +320,7 @@ public:
 		ThreadCallStack_c::Context_c dCtx ( this, dThisThread );
 
 		ScopedMutex_t dLock ( m_dMutex );
-		while ( do_run_one ( dLock, dThisThread ) )
+		while ( do_run_one ( dLock, dThisThread, bBusy ) )
 			dLock.Lock ();
 	}
 
@@ -329,7 +329,7 @@ public:
 		return m_OpQueue.Empty () && m_OpVipQueue.Empty ();
 	}
 
-	bool do_run_one ( ScopedMutex_t& dLock, TaskServiceThreadInfo_t& this_thread )
+	inline bool do_run_one ( ScopedMutex_t& dLock, TaskServiceThreadInfo_t& this_thread, std::atomic<bool>& bBusy ) noexcept
 		REQUIRES ( dLock ) RELEASE ( dLock ) TRY_ACQUIRE ( false, dLock )
 	{
 		while ( !m_bStopped )
@@ -352,8 +352,10 @@ public:
 			else
 				dLock.Unlock ();
 
+			bBusy.store ( true, std::memory_order_relaxed );
 			boost::context::detail::prefetch_range ( pOp, sizeof ( Operation_t ) );
 			pOp->Complete (this);
+			bBusy.store ( false, std::memory_order_relaxed );
 
 			LOG ( SERVICE, MT ) << "completed & unlocked";
 			if ( this_thread.m_iPrivateOutstandingWork>1 )
@@ -425,9 +427,15 @@ public:
 			dLock.Unlock ();
 	}
 
-	long works() const
+	long works() const noexcept
 	{
 		return m_iOutstandingWork;
+	}
+
+	NTasks_t tasks() const
+	{
+		ScopedMutex_t dLock ( m_dMutex );
+		return { (int)m_OpVipQueue.GetLength(), (int)m_OpQueue.GetLength() };
 	}
 };
 
@@ -574,7 +582,7 @@ public:
 		LOGINFO ( TPLIFE, TP ) << "Strand_c created";
 	}
 
-	void ScheduleOp ( Threads::details::SchedulerOperation_t* pOp, bool bVip ) final
+	void ScheduleOp ( Threads::details::SchedulerOperation_t* pOp, bool bVip ) noexcept
 	{
 		LOG ( ST, ST ) << "Post";
 		bool bFirst = Enqueue ( pOp );
@@ -587,20 +595,20 @@ public:
 		LOG ( ST, ST ) << "Post finished";
 	}
 
-	void ScheduleContinuationOp ( Threads::details::SchedulerOperation_t* pOp ) final
+	void ScheduleContinuationOp ( Threads::details::SchedulerOperation_t* pOp ) noexcept
 	{
 		LOG ( ST, ST ) << "ScheduleContinuation";
 		PostContinuationImpl ( pOp );
 		LOG ( ST, ST ) << "Post finished";
 	}
 
-	Keeper_t KeepWorking () final
+	Keeper_t KeepWorking () noexcept
 	{
 		assert ( m_pWorker );
 		return m_pWorker->KeepWorking();
 	}
 
-	bool SetBackend ( Scheduler_i* pBackend ) final
+	bool SetBackend ( Scheduler_i* pBackend ) noexcept
 	{
 		assert ( m_pWorker );
 		ScopedMutex_t tLock ( m_pWorker->m_dMutex );
@@ -620,7 +628,7 @@ public:
 		return true;
 	}
 
-	const char * Name () const final { return m_szName; }
+	const char * Name () const noexcept { return m_szName; }
 };
 
 Strand_c::Invoker_c::Invoker_c ( StrandWorkerPtr_t pRand )
@@ -696,13 +704,19 @@ class ThreadPool_c final : public Worker_i
 	const char * m_szName = nullptr;
 	Service_t m_tService;
 	std::optional<Work> m_dWork;
-	CSphVector<SphThread_t> m_dThreads;
 	CSphMutex m_dMutex;
 	std::atomic<bool> m_bStop {false};
 
+	struct alignas ( 64 ) Thd_t // alignas cacheline, to freely access m_bBusy without cache poisoning
+	{
+		std::atomic<bool> m_bBusy { false };
+		SphThread_t m_tThread;
+		LowThreadDesc_t* m_pChild = nullptr;
+	};
+
 	// support iteration over children for show threads and hazards
-	RwLock_t m_dChildGuard;
-	CSphVector<LowThreadDesc_t *> m_dChildren GUARDED_BY ( m_dChildGuard);
+	mutable RwLock_t m_dChildGuard;
+	CSphFixedVector<Thd_t> m_dThreads { 0 };
 
 	void Post ( Threads::details::SchedulerOperation_t* pOp, bool bVip = false ) // post to primary (vip) or secondary queue
 	{
@@ -731,15 +745,15 @@ class ThreadPool_c final : public Worker_i
 		m_dWork.emplace ( m_tService );
 	}
 
-	void loop (int iChild)
+	void loop (int iChild) NO_THREAD_SAFETY_ANALYSIS
 	{
 		{
 			ScWL_t _ ( m_dChildGuard );
-			m_dChildren[iChild] = &MyThd ();
+			m_dThreads[iChild].m_pChild = &MyThd ();
 		}
 		while (true)
 		{
-			m_tService.run ();
+			m_tService.run ( m_dThreads[iChild].m_bBusy );
 			ScopedMutex_t dLock {m_dMutex};
 			if ( m_bStop )
 				break;
@@ -750,7 +764,7 @@ class ThreadPool_c final : public Worker_i
 			}
 		}
 		ScWL_t _ ( m_dChildGuard );
-		m_dChildren[iChild] = nullptr;
+		m_dThreads[iChild].m_pChild = nullptr;
 	}
 
 public:
@@ -759,16 +773,14 @@ public:
 		, m_tService ( iThreadCount==1 )
 	{
 		createWork ();
-		m_dThreads.Resize ( (int) iThreadCount );
-		m_dChildren.Resize ( (int) iThreadCount );
-		m_dChildren.ZeroVec(); // avoid iterations over not-yet-started threads with garbage here
+		m_dThreads.Reset ( (int) iThreadCount );
 		ARRAY_FOREACH ( i, m_dThreads )
-			Threads::CreateQ ( &m_dThreads[i], [this,i] { loop (i); }, false, m_szName, i );
+			Threads::CreateQ ( &m_dThreads[i].m_tThread, [this,i] { loop (i); }, false, m_szName, i );
 		LOG ( DEBUG, TP ) << "thread pool created with threads: " << iThreadCount;
 		LOGINFO ( TPLIFE, TP ) << "thread pool created with threads: " << iThreadCount;
 	}
 
-	~ThreadPool_c () final
+	~ThreadPool_c ()
 	{
 		LOGINFO ( TPLIFE, TP ) << "thread pool destroying";
 		StopAll();
@@ -777,15 +789,16 @@ public:
 
 	void DiscardOnFork () final
 	{
-		m_dThreads.Reset();
+		ScWL_t _ ( m_dChildGuard );
+		m_dThreads.Reset ( 0 );
 	}
 
-	void ScheduleOp ( Threads::details::SchedulerOperation_t* pOp, bool bVip ) final
+	void ScheduleOp ( Threads::details::SchedulerOperation_t* pOp, bool bVip ) noexcept
 	{
 		Post ( pOp, bVip );
 	}
 
-	void ScheduleContinuationOp ( Threads::details::SchedulerOperation_t* pOp ) final
+	void ScheduleContinuationOp ( Threads::details::SchedulerOperation_t* pOp ) noexcept
 	{
 		PostContinuation ( pOp );
 	}
@@ -808,31 +821,41 @@ public:
 					LOGINFO ( SERVICE_KEEP_MT, MT ) << "KeepWorking finished " << (intptr_t)kwid; } };
 	}
 #else
-	Keeper_t KeepWorking() final
+	Keeper_t KeepWorking() noexcept
 	{
 		m_tService.work_started();
 		return { nullptr, [this] ( void* ) { m_tService.work_finished(); } };
 	}
 #endif
 
-	int WorkingThreads () const final
+	int WorkingThreads () const noexcept NO_THREAD_SAFETY_ANALYSIS
 	{
 		return m_dThreads.GetLength ();
 	}
 
-	int Works () const final
+	int Works () const noexcept
 	{
 		return (int)m_tService.works ();
 	}
 
-	void IterateChildren ( ThreadFN& fnHandler ) final
+	NTasks_t Tasks() const noexcept
 	{
-		ScRL_t _ ( m_dChildGuard );
-		for ( auto* pThread : m_dChildren )
-			fnHandler ( pThread );
+		return m_tService.tasks();
 	}
 
-	void StopAll () final
+	int CurTasks() const noexcept NO_THREAD_SAFETY_ANALYSIS
+	{
+		return (int)m_dThreads.count_of ( [] ( auto& i ) { return i.m_bBusy.load ( std::memory_order_relaxed ); } );
+	}
+
+	void IterateChildren ( ThreadFN& fnHandler ) noexcept
+	{
+		ScRL_t _ ( m_dChildGuard );
+		for ( const auto& tThd : m_dThreads )
+			fnHandler ( tThd.m_pChild );
+	}
+
+	void StopAll () NO_THREAD_SAFETY_ANALYSIS
 	{
 		ScopedMutex_t dLock { m_dMutex };
 		m_bStop = true;
@@ -843,10 +866,10 @@ public:
 		LOG ( DEBUG, TP ) << "stopping thread pool";
 		LOGINFO ( TPLIFE, TP ) << "stopping thread pool";
 		for ( auto & dThread : m_dThreads )
-			Threads::Join ( &dThread );
+			Threads::Join ( &dThread.m_tThread );
 		LOG ( DEBUG, TP ) << "thread pool stopped";
 		LOGINFO ( TPLIFE, TP ) << "thread pool stopped";
-		m_dThreads.Resize ( 0 );
+		m_dThreads.Reset ( 0 );
 	}
 };
 
@@ -856,6 +879,7 @@ class AloneThread_c final : public Worker_i
 	int m_iThreadNum;
 	Service_t m_tService;
 	std::atomic<bool> m_bStarted {false};
+	std::atomic<bool> m_bBusy {false};
 	static int m_iRunningAlones;
 
 	void Post ( Service_t::operation* pOp, bool bVip=false ) // post to primary (vip) or secondary queue
@@ -879,7 +903,7 @@ class AloneThread_c final : public Worker_i
 	void loop ()
 	{
 		Detached::AddThread ( &MyThd () );
-		m_tService.run ();
+		m_tService.run ( m_bBusy );
 		Detached::RemoveThread ( &MyThd () );
 		delete this;
 	}
@@ -894,7 +918,7 @@ public:
 		LOG ( DEBUG, TP ) << "alone worker created " << szName;
 	}
 
-	~AloneThread_c () final
+	~AloneThread_c ()
 	{
 		LOG ( DEBUG, TP ) << "stopping thread";
 		--m_iRunningAlones;
@@ -902,7 +926,7 @@ public:
 		LOGINFO ( TPLIFE, TP ) << "AloneThread_c destroyed";
 	}
 
-	void ScheduleOp ( Service_t::operation* pOp , bool bVip ) final
+	void ScheduleOp ( Service_t::operation* pOp , bool bVip ) noexcept
 	{
 		Post ( pOp, bVip );
 	}
@@ -915,7 +939,7 @@ public:
 		return uWorker.fetch_add ( 1, std::memory_order_relaxed );
 	}
 
-	Keeper_t KeepWorking() final
+	Keeper_t KeepWorking() noexcept
 	{
 		m_tService.work_started();
 		auto kwid = KeepWorkingID();
@@ -925,23 +949,33 @@ public:
 					LOGINFO ( SERVICE_KEEP_ALONE, MT ) << "KeepWorking alone inished " << this << " " << (intptr_t)kwid; } };
 	}
 #else
-	Keeper_t KeepWorking() final
+	Keeper_t KeepWorking() noexcept
 	{
 		m_tService.work_started();
 		return { nullptr, [this] ( void* ) { m_tService.work_finished(); } };
 	}
 #endif
 
-	void StopAll () final {}
+	void StopAll () {}
 
 	static int GetRunners () { return m_iRunningAlones; }
 
-	int Works () const final
+	int Works () const
 	{
 		return GetRunners ();
 	}
 
-	const char* Name() const override
+	NTasks_t Tasks() const noexcept
+	{
+		return m_tService.tasks();
+	}
+
+	int CurTasks() const noexcept
+	{
+		return !!m_bBusy.load(std::memory_order_relaxed);
+	}
+
+	const char* Name() const noexcept
 	{
 		return m_sName.cstr();
 	}
@@ -960,27 +994,27 @@ public:
 		, m_szName { szName }
 	{}
 
-	void ScheduleOp ( details::SchedulerOperation_t* pOp, bool bVip ) final
+	void ScheduleOp ( details::SchedulerOperation_t* pOp, bool bVip ) noexcept
 	{
 		m_pScheduler->ScheduleOp ( pOp, bVip );
 	}
 
-	void ScheduleContinuationOp ( details::SchedulerOperation_t* pOp ) final
+	void ScheduleContinuationOp ( details::SchedulerOperation_t* pOp ) noexcept
 	{
 		m_pScheduler->ScheduleContinuationOp ( pOp );
 	}
 
-	Keeper_t KeepWorking() final
+	Keeper_t KeepWorking() noexcept
 	{
 		return m_pScheduler->KeepWorking();
 	};
 
-	int WorkingThreads() const final
+	int WorkingThreads() const noexcept
 	{
 		return m_pScheduler->WorkingThreads();
 	};
 
-	const char* Name() const final
+	const char* Name() const noexcept
 	{
 		return m_szName ? m_szName : m_pScheduler->Name();
 	}
@@ -1081,10 +1115,11 @@ static int g_iMaxChildrenThreads = 1;
 
 
 namespace {
+static WorkerSharedPtr_t pGlobalPool;
+
 WorkerSharedPtr_t& GlobalPoolSingletone ()
 {
-	static WorkerSharedPtr_t pPool;
-	return pPool;
+	return pGlobalPool;
 }
 }
 
@@ -1098,13 +1133,26 @@ void StartGlobalWorkPool ()
 		pPool = new ThreadPool_c ( g_iMaxChildrenThreads, "work" );
 }
 
+void StopGlobalWorkPool()
+{
+	sphLogDebug ( "StopGlobalWorkPool" );
+	WorkerSharedPtr_t& pPool = GlobalPoolSingletone();
+	if ( pPool )
+		pPool->StopAll();
+}
+
 void SetMaxChildrenThreads ( int iThreads )
 {
 	sphLogDebug ( "SetMaxChildrenThreads to %d", iThreads );
 	g_iMaxChildrenThreads = Max ( 1, iThreads );
 }
 
-Threads::Worker_i * GlobalWorkPool ()
+int MaxChildrenThreads() noexcept
+{
+	return g_iMaxChildrenThreads;
+}
+
+Worker_i * GlobalWorkPool ()
 {
 	WorkerSharedPtr_t& pPool = GlobalPoolSingletone ();
 	assert ( pPool && "invoke StartGlobalWorkPool first");
@@ -1241,7 +1289,7 @@ bool OperationsQueue_c::IsEmpty() const
 
 namespace { // static
 
-class IterationHandler_c : public Threads::details::SchedulerOperation_t
+	class IterationHandler_c : public Threads::details::SchedulerOperation_t
 	{
 		ThreadIteratorFN m_Handler;
 
@@ -1455,29 +1503,25 @@ struct RuntimeThreadContext_t : ISphNoncopyable
 	void PropagateName ();
 };
 
-namespace { // static func
-RuntimeThreadContext_t*& RuntimeThreadContext ()
-{
-	static RuntimeThreadContext_t tStubForMain;
-	static thread_local RuntimeThreadContext_t* pLocalThread = &tStubForMain;
-	return pLocalThread;
-}
+namespace {
+RuntimeThreadContext_t tStubForMain;
+thread_local RuntimeThreadContext_t* g_pLocalThread = &tStubForMain;
 }
 
 // to be used globally from thread env
 RuntimeThreadContext_t& MyThreadContext()
 {
-	return *RuntimeThreadContext();
+	return *g_pLocalThread;
 }
 
-LowThreadDesc_t& Threads::MyThd ()
+LowThreadDesc_t& Threads::MyThd () noexcept
 {
-	return RuntimeThreadContext ()->m_tDesc;
+	return g_pLocalThread->m_tDesc;
 }
 
 void Threads::SetSysThreadName ()
 {
-	RuntimeThreadContext ()->PropagateName ();
+	g_pLocalThread->PropagateName ();
 }
 
 void Threads::JobStarted ()
@@ -1572,7 +1616,7 @@ void RuntimeThreadContext_t::Prepare ( const void * pStack )
 
 void RuntimeThreadContext_t::Run ( const void * pStack )
 {
-	RuntimeThreadContext () = this;
+	g_pLocalThread = this;
 	Prepare ( pStack );
 
 #if SPH_ALLOCS_PROFILER
@@ -1672,9 +1716,9 @@ bool Threads::Create ( SphThread_t * pThread, Handler fnRun, bool bDetached, con
 
 
 namespace { // static func
+thread_local CrashQuery_t* pTlsCrashQuery = nullptr;
 CrashQuery_t** g_ppTlsCrashQuery ()
 {
-	static thread_local CrashQuery_t* pTlsCrashQuery = nullptr;
 	return &pTlsCrashQuery;
 }
 
@@ -1719,45 +1763,42 @@ void CrashQueryKeeper_c::RestoreCrashQuery () const
 	GlobalCrashQuerySet ( m_tReference );
 }
 
-namespace {
-constexpr char sWeekday[7][4] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-constexpr char sMonth[12][4] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+namespace
+{
+constexpr char dWeekdays[7][4] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+constexpr char dMonths[12][4] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+}
+
+
+int sphFormatTime ( int64_t iNow, char * sTimeBuf, int iBufLen )
+{
+	time_t ts = (time_t)( iNow / 1000000 ); // on some systems (eg. FreeBSD 6.2), tv.tv_sec has another type and we can't just pass it
+
+	cctz::civil_second tCS = ConvertTimeLocal(ts);
+	return snprintf ( sTimeBuf, iBufLen, "%.3s %.3s%3d %.2d:%.2d:%.2d.%.3d %d", dWeekdays[GetWeekDay ( tCS, true )-1], dMonths[tCS.month()-1], tCS.day(), tCS.hour(), tCS.minute(), tCS.second(), (int)( ( iNow % 1000000 ) / 1000 ), (int)tCS.year() );
+}
+
+void sphFormatTime ( int64_t iNow, StringBuilder_c & sOut )
+{
+	time_t ts = (time_t)( iNow / 1000000 ); // on some systems (eg. FreeBSD 6.2), tv.tv_sec has another type, and we can't just pass it
+	cctz::civil_second tCS = ConvertTimeLocal(ts);
+
+	sOut << dWeekdays[GetWeekDay ( tCS, true )-1]
+		 << ' ' << dMonths[tCS.month()-1]
+		 << ' ' << Digits<2>(tCS.day())
+		 << ' ' << Digits<2>(tCS.hour()) << ':' << Digits<2>(tCS.minute()) << ':' << Digits<2>(tCS.second()) << '.' << FixedNum<10,3,0,'0'>( ( iNow % 1000000 ) / 1000 )
+		 << ' ' << tCS.year();
 }
 
 /// format current timestamp (for logging, or whatever)
 int sphFormatCurrentTime ( char* sTimeBuf, int iBufLen )
 {
-	int64_t iNow = sphMicroTimer();
-	time_t ts = (time_t)( iNow / 1000000 ); // on some systems (eg. FreeBSD 6.2), tv.tv_sec has another type and we can't just pass it
-
-#if !_WIN32
-	struct tm tmp;
-	localtime_r ( &ts, &tmp );
-#else
-	struct tm tmp;
-	tmp = *localtime ( &ts );
-#endif
-
-	return snprintf ( sTimeBuf, iBufLen, "%.3s %.3s%3d %.2d:%.2d:%.2d.%.3d %d", sWeekday[tmp.tm_wday], sMonth[tmp.tm_mon], tmp.tm_mday, tmp.tm_hour, tmp.tm_min, tmp.tm_sec, (int)( ( iNow % 1000000 ) / 1000 ), 1900 + tmp.tm_year );
+	return sphFormatTime ( sphMicroTimer (), sTimeBuf, iBufLen );
 }
 
 void sphFormatCurrentTime ( StringBuilder_c& sOut )
 {
-	int64_t iNow = sphMicroTimer();
-	time_t ts = (time_t)( iNow / 1000000 ); // on some systems (eg. FreeBSD 6.2), tv.tv_sec has another type, and we can't just pass it
-
-#if !_WIN32
-	struct tm tmp;
-	localtime_r ( &ts, &tmp );
-#else
-	struct tm tmp;
-	tmp = *localtime ( &ts );
-#endif
-	sOut << sWeekday[tmp.tm_wday]
-		 << ' ' << sMonth[tmp.tm_mon]
-		 << ' ' << Digits<2>(tmp.tm_mday)
-		 << ' ' << Digits<2>(tmp.tm_hour) << ':' << Digits<2>(tmp.tm_min) << ':' << Digits<2>(tmp.tm_sec) << '.' << FixedNum<10,3,0,'0'>( ( iNow % 1000000 ) / 1000 )
-		 << ' ' << 1900 + tmp.tm_year;
+	return sphFormatTime ( sphMicroTimer (), sOut );
 }
 
 CSphString sphCurrentUtcTime()
@@ -1765,15 +1806,13 @@ CSphString sphCurrentUtcTime()
 	int64_t iNow = sphMicroTimer();
 	time_t ts = (time_t)( iNow / 1000000 ); // on some systems (eg. FreeBSD 6.2), tv.tv_sec has another type and we can't just pass it
 
-	struct tm tmp;
-	gmtime_r ( &ts, &tmp );
-	//	localtime_r ( &ts, &tmp );
+	cctz::civil_second tCS = ConvertTimeUTC(ts);
 
 	StringBuilder_c tOut;
-	tOut << 1900 + tmp.tm_year
-		<< '-' << Digits<2>(tmp.tm_mon + 1)
-		<< '-' << Digits<2>(tmp.tm_mday)
-		<< 'T' << Digits<2>(tmp.tm_hour) << ':' << Digits<2>(tmp.tm_min) << ':' << Digits<2>(tmp.tm_sec)
+	tOut << tCS.year()
+		<< '-' << Digits<2>(tCS.month())
+		<< '-' << Digits<2>(tCS.day())
+		<< 'T' << Digits<2>(tCS.hour()) << ':' << Digits<2>(tCS.minute()) << ':' << Digits<2>(tCS.second())
 		<< '.' << FixedNum<10, 3, 0, '0'> ( ( iNow % 1000000 ) / 1000 );
 //	tOut.Sprintf ( "%.4d-%.2d-%.2dT%.2d:%.2d:%.2d.%.3d", // YYYY-MM-DDThh:mm:ss[.SSS]
 //		1900 + tmp.tm_year,

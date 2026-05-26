@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -15,10 +15,14 @@
 #include "attrstub.h"
 #include "vector.h"
 #include "blobs.h"
+#include <cstdarg>
 
 bool StrEq ( const char* l, const char* r );
 bool StrEqN ( const char* l, const char* r );
-
+bool StrEq ( Str_t l, const char* r );
+bool StrEqN ( Str_t l, const char* r );
+bool StrEq ( Str_t l, Str_t r );
+bool StrEqN ( Str_t l, Str_t r );
 
 /// immutable C string proxy
 struct CSphString
@@ -73,6 +77,11 @@ public:
 		return StrEq ( t, m_sValue );
 	}
 
+	inline bool operator== ( Str_t t ) const
+	{
+		return StrEq ( t, m_sValue );
+	}
+
 	inline bool operator== ( const CSphString& t ) const
 	{
 		return operator== ( t.cstr() );
@@ -84,6 +93,11 @@ public:
 	}
 
 	bool operator!= ( const char* t ) const
+	{
+		return !operator== ( t );
+	}
+
+	bool operator!= ( Str_t t ) const
 	{
 		return !operator== ( t );
 	}
@@ -184,9 +198,13 @@ CSphString SphSprintfVa ( const char* sTemplate, va_list ap );
 CSphString SphSprintf ( const char* sTemplate, ... );
 
 /// commonly used
+void ToLower ( Str_t sVal );
+
 using StrVec_t = CSphVector<CSphString>;
 using StrtVec_t = CSphVector<Str_t>;
 
-void ToLower ( Str_t sVal );
+#include "fixedvector.h"
+using FixedStrVec_t = CSphFixedVector<CSphString>;
+using FixedStrtVec_t = CSphFixedVector<Str_t>;
 
 #include "string_impl.h"

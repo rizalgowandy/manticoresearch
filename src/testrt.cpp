@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -17,6 +17,7 @@
 #include "sphinxsort.h"
 #include "searchdaemon.h"
 #include "indexing_sources/source_mysql.h"
+#include "sphinxquery/xqparser.h"
 
 #if HAVE_RTESTCONFIG_H
 #include "rtestconfig.h"
@@ -74,7 +75,7 @@ void DoSearch ( CSphIndex * pIndex )
 	{
 		auto & tOneRes = tResult.m_dResults.Add ();
 		tOneRes.FillFromSorter ( pSorter );
-		printf ( "%d results found in %d.%03d sec!\n", tOneRes.m_dMatches.GetLength(), tResult.m_iQueryTime/1000, tResult.m_iQueryTime%1000 );
+		printf ( "%d results found in %d.%03d sec!\n", tOneRes.m_dMatches.GetLength(), tResult.GetQueryTimeMs()/1000, tResult.GetQueryTimeMs()%1000 );
 		ARRAY_FOREACH ( i, tOneRes.m_dMatches )
 			printf ( "%d. rowid=%u, weight=%d\n", 1+i, tOneRes.m_dMatches[i].m_tRowID, tOneRes.m_dMatches[i].m_iWeight );
 	}
@@ -94,7 +95,7 @@ void DoIndexing ( CSphSource_SQL * pSrc, RtIndex_i * pIndex )
 	int64_t tmMaxCommit = 0;
 	int iCommits = 0;
 
-	InsertDocData_t tDoc ( pIndex->GetMatchSchema() );
+	InsertDocData_c tDoc ( pIndex->GetMatchSchema() );
 	tDoc.m_dFields.Resize(g_iFieldsCount);
 
 	int iDynamic = pIndex->GetMatchSchema().GetRowSize();
@@ -473,6 +474,7 @@ bool SqlParamsConfigure ( CSphSourceParams_SQL &tParams, const CSphConfigSection
 
 	LOC_GETS ( tParams.m_sQuery, "sql_query" );
 	LOC_GETA ( tParams.m_dQueryPre, "sql_query_pre" );
+	LOC_GETA ( tParams.m_dQueryPreAll, "sql_query_pre_all" );
 	LOC_GETA ( tParams.m_dQueryPost, "sql_query_post" );
 	LOC_GETS ( tParams.m_sQueryRange, "sql_query_range" );
 	LOC_GETA ( tParams.m_dQueryPostIndex, "sql_query_post_index" );
@@ -628,8 +630,8 @@ int main ( int argc, char ** argv )
 	g_iFieldsCount = tSrcSchema.GetFieldsCount();
 
 	CSphConfigSection tRTConfig;
-	sphRTInit ( tRTConfig, true, nullptr );
-	Binlog::Configure ( tRTConfig, true, 0 );
+	sphRTInit ( "" );
+	Binlog::Configure ( tRTConfig, 0 );
 	SmallStringHash_T< CSphIndex * > dTemp;
 	Binlog::Replay ( dTemp );
 	auto pIndex = sphCreateIndexRT ( "testrt", DATAFLD "dump", tSchema, 32*1024*1024, false ).release();

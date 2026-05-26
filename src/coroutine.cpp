@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // All rights reserved
 //
 // This program is free software; you can redistribute it and/or modify
@@ -26,11 +26,14 @@ namespace Threads {
 
 bool StackMockingAllowed()
 {
-#if HAVE_VALGRIND_VALGRIND_H
+#if __has_include( <valgrind/valgrind.h>)
 	if (!!RUNNING_ON_VALGRIND)
+	{
+		sphWarning ( "Running under valgrind, so stack mocking is not allowed");
 		return false;
+	}
 #endif
-	return !val_from_env ( "NO_STACK_CALCULATION", false );
+	return !env_exists ( "NO_STACK_CALCULATION" );
 }
 
 
@@ -101,6 +104,11 @@ public:
 		return m_eState==State_e::Finished;
 	}
 
+	bool IsMocked () const noexcept
+	{
+		return m_tStack.second==StackFlavour_E::mocked_prealloc;
+	}
+
 	// yield to external context
 	void Yield_ ()
 	{
@@ -160,9 +168,9 @@ struct CoroState_t
 
 namespace Coro {
 
-class Worker_c : public details::SchedulerOperation_t
+class Worker_c final: public details::SchedulerOperation_t
 {
-	// our executor (thread pool, etc which provides Schedule(handler) method)
+	// our executor (thread pool, etc. which provides Schedule(handler) method)
 	Scheduler_i * m_pScheduler = nullptr;
 	Keeper_t m_tKeepSchedulerAlive;
 	Waiter_t m_tTracer; // may be set to trace this worker lifetime
@@ -173,8 +181,7 @@ class Worker_c : public details::SchedulerOperation_t
 	Handler m_fnYieldWithProceeder = nullptr;
 
 	// chain nested workers via TLS
-	static thread_local Worker_c * m_pTlsThis;
-	Worker_c * m_pPreviousWorker = nullptr;
+	void * m_pPreviousWorker = nullptr;
 
 	// operative stuff to be as near as possible
 	void * m_pCurrentTaskInfo = nullptr;
@@ -187,6 +194,10 @@ class Worker_c : public details::SchedulerOperation_t
 	int64_t			m_tmNextTimePointUS = 0;
 	int64_t			m_tmRuntimePeriodUS = 0;
 	int				m_iNumOfRestarts = 0;
+
+	// task-local msg
+	StringBuilder_c m_sTlsMsg;
+	StringBuilder_c* m_pPrevTlsMsg = nullptr;
 
 	static uint64_t InitWorkerID()
 	{
@@ -204,33 +215,35 @@ class Worker_c : public details::SchedulerOperation_t
 		m_tInternalTimer.EngageAt ( m_tmNextTimePointUS );
 	}
 
-	inline void CoroGuardEnter()
+	inline void CoroGuardEnter() noexcept
 	{
-		m_pPreviousWorker = std::exchange ( m_pTlsThis, this );
-		m_pCurrentTaskInfo = MyThd().m_pTaskInfo.exchange ( m_pCurrentTaskInfo, std::memory_order_relaxed );
+		auto& tMyThd = MyThd();
+		m_pPreviousWorker = std::exchange ( tMyThd.m_pWorker, this );
+		m_pPrevTlsMsg = tMyThd.m_pTlsMsg.exchange ( &m_sTlsMsg, std::memory_order_relaxed );
+		m_pCurrentTaskInfo = tMyThd.m_pTaskInfo.exchange ( m_pCurrentTaskInfo, std::memory_order_relaxed );
 		m_tmCpuTimeBase -= sphThreadCpuTimer();
 		++m_iNumOfRestarts;
 		CheckEngageTimer( TimePoint_e::fromresume );
 	}
 
-	inline void CoroGuardFinishExit()
+	inline void CoroGuardExit()
 	{
 		if ( m_tmRuntimePeriodUS )
 			m_tInternalTimer.UnEngage();
 		m_tmCpuTimeBase += sphThreadCpuTimer();
-		m_pCurrentTaskInfo = MyThd().m_pTaskInfo.exchange ( m_pCurrentTaskInfo, std::memory_order_relaxed );
-	}
-
-	static inline void CoroGuardExit()
-	{
-		std::exchange ( m_pTlsThis, m_pTlsThis->m_pPreviousWorker ) -> CoroGuardFinishExit();
+		auto& tMyThd = MyThd();
+		m_pCurrentTaskInfo = tMyThd.m_pTaskInfo.exchange ( m_pCurrentTaskInfo, std::memory_order_relaxed );
+		tMyThd.m_pTlsMsg.store ( m_pPrevTlsMsg, std::memory_order_relaxed );
+		std::exchange ( tMyThd.m_pWorker, m_pPreviousWorker );
 	}
 
 	// RAII worker's keeper
-	struct CoroGuard_t
+	class CoroGuard_c
 	{
-		explicit CoroGuard_t ( Worker_c * pWorker ) { pWorker->CoroGuardEnter(); }
-		~CoroGuard_t () { Worker_c::CoroGuardExit(); }
+		Worker_c* m_pWorker;
+	public:
+		explicit CoroGuard_c ( Worker_c* pWorker ) : m_pWorker { pWorker } { m_pWorker->CoroGuardEnter(); }
+		~CoroGuard_c() { m_pWorker->CoroGuardExit(); }
 	};
 
 	static void DoComplete ( void* pOwner, SchedulerOperation_t* pBase )
@@ -298,7 +311,7 @@ private:
 			ResetRunningAndReschedule();
 	}
 
-	inline void Schedule(bool bVip=true) noexcept
+	inline void Schedule(bool bVip=false) noexcept
 	{
 		LOG ( DEBUGV, COROW ) << "Coro::Worker_c::Schedule (" << bVip << ", " << m_pScheduler << ")";
 		assert ( m_pScheduler );
@@ -327,15 +340,15 @@ public:
 	// May refer to parent's task info as read-only. For changes has dedicated mini info, also can create and use it's own local.
 	static void StartOther ( Handler fnHandler, Scheduler_i * pScheduler, size_t iStack, Waiter_t tWait )
 	{
-		( new Worker_c ( myinfo::OwnMini ( std::move ( fnHandler ) ), pScheduler, std::move ( tWait ), iStack ) )->Schedule ( false );
+		( new Worker_c ( myinfo::OwnMini ( std::move ( fnHandler ) ), pScheduler, std::move ( tWait ), iStack ) )->Schedule ();
 	}
 
-	// invoked from CallCoroutine -> ReplicationStart on daemon startup. Schedule into primary queue.
+	// invoked from CallCoroutine -> ReplicationServiceStart on daemon startup. Schedule into primary queue.
 	// Adopt parent's task info (if any), and may change it exclusively.
 	// Parent thread at the moment blocked and may display info about it
 	static void StartCall ( Handler fnHandler, Scheduler_i* pScheduler, Waiter_t tWait )
 	{
-		( new Worker_c ( myinfo::StickParent ( std::move ( fnHandler ) ), pScheduler, std::move ( tWait ) ) )->Schedule ();
+		( new Worker_c ( myinfo::StickParent ( std::move ( fnHandler ) ), pScheduler, std::move ( tWait ) ) )->Schedule ( true );
 	}
 
 	// from Coro::Continue -> all continuations (main purpose - continue with extended stack).
@@ -346,13 +359,13 @@ public:
 		( new Worker_c ( myinfo::StickParent ( std::move ( fnHandler ) ), pScheduler, std::move ( tWait ), iStack ) )->ScheduleContinuation ();
 	}
 
-	static void MockRun ( Handler fnHandler, VecTraits_T<BYTE> dStack )
+	ATTRIBUTE_NO_SANITIZE_ADDRESS static void MockRun ( Handler fnHandler, VecTraits_T<BYTE> dStack )
 	{
 		Worker_c tAction ( std::move ( fnHandler ), dStack );
 		auto pOldStack = Threads::TopOfStack ();
 		Threads::SetTopStack ( &dStack.Last() );
 		{
-			CoroGuard_t pThis ( &tAction );
+			CoroGuard_c pThis ( &tAction );
 			tAction.m_tCoroutine.Run ();
 		}
 		Threads::SetTopStack ( pOldStack );
@@ -376,15 +389,15 @@ public:
 			ScheduleContinuation();
 	}
 
-	inline void Pause() noexcept
+	inline void Pause ( bool bVip = true ) noexcept
 	{
 		if ( ( m_tState.SetFlags ( CoroState_t::Running_e | CoroState_t::Paused_e ) & CoroState_t::Running_e ) == 0 )
-			Schedule();
+			Schedule ( bVip );
 	}
 
-	inline void Reschedule () noexcept
+	inline void Reschedule ( bool bVip = true ) noexcept
 	{
-		Pause();
+		Pause ( bVip );
 		Yield_();
 		m_tState.ResetFlags ( CoroState_t::Paused_e );
 	}
@@ -412,7 +425,7 @@ public:
 	inline bool Resume () noexcept
 	{
 		{
-			CoroGuard_t pThis (this);
+			CoroGuard_c pThis (this);
 			m_tCoroutine.Run();
 		}
 		if ( m_tCoroutine.IsFinished () )
@@ -443,6 +456,11 @@ public:
 		return m_tCoroutine.GetStackSize ();
 	}
 
+	bool IsMocked () const noexcept
+	{
+		return m_tCoroutine.IsMocked ();
+	}
+
 	inline Scheduler_i * CurrentScheduler() const noexcept
 	{
 		return m_pScheduler;
@@ -465,7 +483,7 @@ public:
 
 	inline static Worker_c* CurrentWorker() noexcept
 	{
-		return m_pTlsThis;
+		return (Worker_c*)Threads::MyThd().m_pWorker;
 	}
 
 	inline bool Wake ( size_t iExpectedEpoch, bool bVip ) noexcept
@@ -524,7 +542,6 @@ public:
 	}
 };
 
-thread_local Worker_c * Worker_c::m_pTlsThis = nullptr;
 
 Worker_c* CurrentWorker() noexcept
 {
@@ -549,7 +566,7 @@ void Go ( Handler&& fnHandler, Scheduler_i * pScheduler )
 }
 
 // start secondary subtasks (parallel search, pq processing, etc)
-void Co ( Handler&& fnHandler, Waiter_t tSignaller)
+void Co ( Handler&& fnHandler, Waiter_t tSignaller )
 {
 	auto pScheduler = CurrentScheduler ();
 	if ( !pScheduler )
@@ -623,12 +640,6 @@ int NumOfRestarts() noexcept
 
 } // namespace Coro
 
-Resumer_fn MakeCoroExecutor ( Handler fnHandler )
-{
-	auto* pWorker = Coro::Worker ()->MakeWorker ( std::move ( fnHandler ) );
-	return [pWorker] () -> bool { return pWorker->Resume(); };
-}
-
 void CallPlainCoroutine ( Handler fnHandler, Scheduler_i* pScheduler )
 {
 	if ( !pScheduler )
@@ -639,7 +650,12 @@ void CallPlainCoroutine ( Handler fnHandler, Scheduler_i* pScheduler )
 	tEvent.WaitEvent ();
 }
 
-void MockCallCoroutine ( VecTraits_T<BYTE> dStack, Handler fnHandler )
+void StartCall ( Handler fnHandler, Waiter_t tWait, Scheduler_i* pScheduler )
+{
+	Coro::Worker_c::StartCall ( std::move ( fnHandler ), pScheduler, std::move(tWait) );
+}
+
+ATTRIBUTE_NO_SANITIZE_ADDRESS void MockCallCoroutine ( VecTraits_T<BYTE> dStack, Handler fnHandler )
 {
 	Coro::Worker_c::MockRun ( std::move ( fnHandler ), dStack );
 }
@@ -672,10 +688,8 @@ bool CallCoroutineRes ( Predicate fnHandler )
 }
 
 // start secondary subtasks (parallel search, pq processing, etc)
-void StartJob ( Handler fnHandler )
+void StartJob ( Handler fnHandler, Scheduler_i * pScheduler )
 {
-	auto pScheduler = GlobalWorkPool();
-
 	assert ( pScheduler );
 	Coro::Worker_c::StartPrimary ( std::move ( fnHandler ), pScheduler, false );
 }
@@ -770,7 +784,15 @@ int MyStackSize()
 	return Threads::STACK_SIZE;
 }
 
-int64_t GetStackUsed()
+bool IsIMocked ()
+{
+	auto pWorker = Coro::Worker_c::CurrentWorker();
+	if ( pWorker )
+		return pWorker->IsMocked();
+	return false;
+}
+
+int64_t ATTRIBUTE_NO_SANITIZE_ADDRESS GetStackUsed ()
 {
 	BYTE cStack;
 	auto* pStackTop = (const BYTE*)MyStack();
@@ -832,11 +854,17 @@ void SetDefaultThrottlingPeriodMS ( int tmPeriodMs )
 	tmThrotleTimeQuantumMs = tmPeriodMs < 0 ? tmDefaultThrotleTimeQuantumMs : tmPeriodMs;
 }
 
-void SetThrottlingPeriod ( int tmPeriodMs )
+void SetThrottlingPeriodMS ( int tmPeriodMs )
 {
 	if ( tmPeriodMs < 0 )
 		tmPeriodMs = tmThrotleTimeQuantumMs;
-	Worker()->SetTimePeriodUS ( tmPeriodMs * 1000 );
+	SetThrottlingPeriodUS ( tmPeriodMs * 1000 );
+}
+
+void SetThrottlingPeriodUS ( int64_t tmPeriodUs )
+{
+	assert ( tmPeriodUs>=0 );
+	Worker()->SetTimePeriodUS ( tmPeriodUs );
 }
 
 int64_t GetThrottlingPeriodUS ()
@@ -844,10 +872,10 @@ int64_t GetThrottlingPeriodUS ()
 	return Worker()->GetTimePeriodUS ();
 }
 
-void RescheduleAndKeepCrashQuery()
+void RescheduleAndKeepCrashQuery ( bool bVip ) noexcept
 {
 	CrashQueryKeeper_c _;
-	Coro::Worker()->Reschedule(); // timer will be automatically re-engaged on resume
+	Coro::Worker()->Reschedule ( bVip ); // timer will be automatically re-engaged on resume
 }
 
 inline void fnResume ( volatile Worker_c* pCtx )
@@ -880,15 +908,15 @@ Event_c::~Event_c ()
 // else atomically set flag 'signaled'
 void Event_c::SetEvent()
 {
-	BYTE uState = m_uState.load ( std::memory_order_relaxed );
+	BYTE uState = m_uState.load ( std::memory_order_acquire );
 	do
 	{
 		if ( uState & Waited_e )
 		{
-			m_uState.store ( Signaled_e ); // memory_order_sec_cst - to ensure that next call will not resume again
+			m_uState.store ( Signaled_e, std::memory_order_release );
 			return fnResume ( m_pCtx );
 		}
-	} while ( !m_uState.compare_exchange_weak ( uState, uState | Signaled_e, std::memory_order_relaxed ) );
+	} while ( !m_uState.compare_exchange_weak ( uState, uState | Signaled_e, std::memory_order_release, std::memory_order_acquire ) );
 }
 
 // if 'signaled' state detected, clean all flags and return.
@@ -896,22 +924,22 @@ void Event_c::SetEvent()
 // on resume clean all flags.
 void Event_c::WaitEvent()
 {
-	if ( !( m_uState.load ( std::memory_order_relaxed ) & Signaled_e ) )
+	if ( !( m_uState.load ( std::memory_order_acquire ) & Signaled_e ) )
 	{
 		if ( m_pCtx != Worker() )
 			m_pCtx = Worker();
 		YieldWith ( [this] {
-			BYTE uState = m_uState.load ( std::memory_order_relaxed );
+			BYTE uState = m_uState.load ( std::memory_order_acquire );
 			do
 			{
 				if ( uState & Signaled_e )
 					return fnResume ( m_pCtx );
-			} while ( !m_uState.compare_exchange_weak ( uState, uState | Waited_e, std::memory_order_relaxed ) );
+			} while ( !m_uState.compare_exchange_weak ( uState, uState | Waited_e, std::memory_order_acq_rel, std::memory_order_acquire ) );
 		} );
 	}
 
-	m_uState.store ( 0, std::memory_order_relaxed );
-	std::atomic_thread_fence ( std::memory_order_release );
+	std::atomic_thread_fence ( std::memory_order_acquire );
+	m_uState.store ( 0, std::memory_order_release );
 }
 
 
@@ -956,7 +984,7 @@ bool WaitQueue_c::SuspendAndWaitUntil ( sph::Spinlock_lock& tLock, Worker_c* pAc
 	});
 
 	// resumed. Check if deadline is reached
-	if ( sph::TimeExceeded ( iTimestamp ) )
+	if ( sph::TimeExceeded ( iTimestamp ) || sphInterrupted () )
 	{
 		tLock.lock();
 		// remove from waiting-queue
@@ -965,6 +993,7 @@ bool WaitQueue_c::SuspendAndWaitUntil ( sph::Spinlock_lock& tLock, Worker_c* pAc
 		tLock.unlock();
 		return false;
 	}
+	assert ( !w.is_linked () );
 	return true;
 }
 
@@ -1051,7 +1080,6 @@ Debug (static constexpr DWORD uxFE = ~ux01;)		   // mask for w-lock flag (0xFFFF
 void RWLock_c::ReadLock()
 {
 	while ( true ) {
-		// store this task in order to be resumed later
 		sph::Spinlock_lock tLock { m_tInternalMutex };
 		if ( !( m_uState & ux01 ) && m_tWaitWQueue.Empty() )
 		{
@@ -1090,6 +1118,73 @@ void RWLock_c::Unlock()
 		m_tWaitWQueue.NotifyOne();
 	else
 		m_tWaitRQueue.NotifyAll();
+}
+
+// returns true if there are single read-lock, and pending write-lock
+bool RWLock_c::TestNextWlock () const noexcept
+{
+	sph::Spinlock_lock tLock { m_tInternalMutex };
+
+	if ( m_uState != ux02 )
+		return false;
+
+	return !m_tWaitWQueue.Empty ();
+}
+
+void ReadTableLock_c::WaitRead() noexcept
+{
+	sph::Spinlock_lock tLock { m_tInternalMutex };
+	++m_uReads;
+	while ( m_uWrites )
+		m_tWaitRQueue.SuspendAndWait ( tLock, Worker() );
+}
+
+bool ReadTableLock_c::TryWrite() noexcept
+{
+	sph::Spinlock_lock tLock { m_tInternalMutex };
+	if ( m_uReads )
+		return false;
+	++m_uWrites;
+	return true;
+}
+
+void ReadTableLock_c::FinishWrite() noexcept
+{
+	sph::Spinlock_lock tLock { m_tInternalMutex };
+	if ( !--m_uWrites )
+		m_tWaitRQueue.NotifyAll();
+}
+
+bool ReadTableLock_c::UnlockRead() noexcept
+{
+	sph::Spinlock_lock tLock { m_tInternalMutex };
+
+	if ( !m_uReads )
+		return false;
+
+	--m_uReads;
+	return true;
+}
+
+[[nodiscard]] DWORD ReadTableLock_c::GetReads() const noexcept
+{
+	return m_uReads;
+}
+
+ScopedWriteTable_c::ScopedWriteTable_c ( ReadTableLock_c& tTableLock )
+	: m_tTableLock { tTableLock }
+	, m_bCanWrite { tTableLock.TryWrite() }
+{}
+
+ScopedWriteTable_c::~ScopedWriteTable_c()
+{
+	if (m_bCanWrite)
+		m_tTableLock.FinishWrite();
+}
+
+bool ScopedWriteTable_c::CanWrite() const noexcept
+{
+	return m_bCanWrite;
 }
 
 } // namespace Coro

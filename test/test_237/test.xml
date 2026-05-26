@@ -52,12 +52,12 @@ for ( $commit=0; $commit<4; $commit++ )
 	$rows = "";
 	for ( $row=0; $row<10; $row++ )
 	{
-		$rows .= json_encode ( array ( "create"=>array("index"=>"test_rt", "id"=>$id, "doc"=>array( "gid"=>$id, "dummy"=>"test".$id, "title"=>RandomWordsTest237 ( 10000, $id ) ))) );
+		$rows .= json_encode ( array ( "create"=>array("table"=>"test_rt", "id"=>$id, "doc"=>array( "gid"=>$id, "dummy"=>"test".$id, "title"=>RandomWordsTest237 ( 10000, $id ) ))) );
 		$rows .= "\n";
 		$id++;
 	}
-	
-	$curl_desc = array ( CURLOPT_RETURNTRANSFER => 1, CURLOPT_CONNECTTIMEOUT=>1, CURLOPT_URL => "127.0.0.1:$sd_http_port/json/bulk" );
+
+	$curl_desc = CurlDesc ( "json/bulk" );
 	$curl_desc[CURLOPT_POST] = 1;
 	$curl_desc[CURLOPT_POSTFIELDS] = $rows;
 
@@ -75,7 +75,7 @@ for ( $commit=0; $commit<4; $commit++ )
 
 $q = <<<'EOD'
 {
-  "index":"test_rt",
+  "table":"test_rt",
   "query":
   {
     "bool":

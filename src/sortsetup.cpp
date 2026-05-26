@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -149,7 +149,7 @@ inline ESphSortKeyPart Attr2Keypart_ ( ESphAttr eType )
 class SortStateSetup_c
 {
 public:
-			SortStateSetup_c ( const char * szTok, SortClauseTokenizer_c & tTok, CSphMatchComparatorState & tState, CSphVector<ExtraSortExpr_t> & dExtraExprs, int iField, const ISphSchema & tSchema, const CSphQuery & tQuery );
+			SortStateSetup_c ( const char * szTok, SortClauseTokenizer_c & tTok, CSphMatchComparatorState & tState, CSphVector<ExtraSortExpr_t> & dExtraExprs, int iField, const ISphSchema & tSchema, const CSphQuery & tQuery, const JoinArgs_t * pJoinArgs );
 
 	bool	Setup ( CSphString & sError );
 
@@ -161,6 +161,7 @@ private:
 	const int					m_iField;
 	const ISphSchema &			m_tSchema;
 	const CSphQuery &			m_tQuery;
+	const JoinArgs_t *			m_pJoinArgs = nullptr;
 
 	int							m_iAttr = -1;
 	ESphAttr					m_eAttrType = SPH_ATTR_NONE;
@@ -180,7 +181,7 @@ private:
 };
 
 
-SortStateSetup_c::SortStateSetup_c ( const char * szTok, SortClauseTokenizer_c & tTok, CSphMatchComparatorState & tState, CSphVector<ExtraSortExpr_t> & dJsonExprs, int iField, const ISphSchema & tSchema, const CSphQuery & tQuery )
+SortStateSetup_c::SortStateSetup_c ( const char * szTok, SortClauseTokenizer_c & tTok, CSphMatchComparatorState & tState, CSphVector<ExtraSortExpr_t> & dJsonExprs, int iField, const ISphSchema & tSchema, const CSphQuery & tQuery, const JoinArgs_t * pJoinArgs )
 	: m_szTok ( szTok )
 	, m_tTok ( tTok )
 	, m_tState ( tState )
@@ -188,6 +189,7 @@ SortStateSetup_c::SortStateSetup_c ( const char * szTok, SortClauseTokenizer_c &
 	, m_iField ( iField )
 	, m_tSchema ( tSchema )
 	, m_tQuery ( tQuery )
+	, m_pJoinArgs ( pJoinArgs )
 {}
 
 
@@ -216,6 +218,8 @@ void SortStateSetup_c::UnifyInternalAttrNames()
 		m_szTok = "@groupby"; // facet() is essentially a @groupby alias
 	else if ( strcasecmp ( m_szTok, "count" )>=0 && m_tTok.IsSparseCount ( m_szTok + sizeof ( "count" ) - 1 ) ) // epression count(*) with various spaces
 		m_szTok = "@count";
+	else if ( !strcasecmp ( m_szTok, "knn_dist()" ) )
+		m_szTok = "@knn_dist";
 }
 
 
@@ -328,13 +332,18 @@ void SortStateSetup_c::SetupJsonAttr()
 bool SortStateSetup_c::SetupJsonField ( CSphString & sError )
 {
 	CSphString sJsonCol;
-	if ( !sphJsonNameSplit ( m_szTok, &sJsonCol ) )
+	if ( !sphJsonNameSplit ( m_szTok, m_tQuery.m_sJoinIdx.cstr(), &sJsonCol ) )
 		return true;
 
 	m_iAttr = m_tSchema.GetAttrIndex ( sJsonCol.cstr() );
 	if ( m_iAttr>=0 )
 	{
 		ExprParseArgs_t tExprArgs;
+		if ( m_pJoinArgs )
+		{
+			tExprArgs.m_pJoinIdx = &m_pJoinArgs->m_sIndex2;
+			tExprArgs.m_pJoinIdxLeft = &m_pJoinArgs->m_sIndex1;
+		}
 		ISphExpr * pExpr = sphExprParse ( m_szTok, m_tSchema, sError, tExprArgs );
 		if ( !pExpr )
 			return false;
@@ -353,11 +362,16 @@ bool SortStateSetup_c::SetupColumnar ( CSphString & sError )
 		return true;
 
 	const CSphColumnInfo & tAttr = m_tSchema.GetAttr(m_iAttr);
-	if ( !tAttr.IsColumnar() )
+	if ( !tAttr.IsColumnar() || tAttr.IsJoined() )
 		return true;
 
 	ExprParseArgs_t tExprArgs;
 	tExprArgs.m_pAttrType = &m_eAttrType;
+	if ( m_pJoinArgs )
+	{
+		tExprArgs.m_pJoinIdx = &m_pJoinArgs->m_sIndex2;
+		tExprArgs.m_pJoinIdxLeft = &m_pJoinArgs->m_sIndex1;
+	}
 	ISphExpr * pExpr = sphExprParse ( m_szTok, m_tSchema, sError, tExprArgs );
 	if ( !pExpr )
 		return false;
@@ -394,6 +408,11 @@ void SortStateSetup_c::SetupJsonConversions()
 	ExprParseArgs_t tExprArgs;
 	tExprArgs.m_pAttrType = &eAttrType;
 	CSphString sError; // ignored
+	if ( m_pJoinArgs )
+	{
+		tExprArgs.m_pJoinIdx = &m_pJoinArgs->m_sIndex2;
+		tExprArgs.m_pJoinIdxLeft = &m_pJoinArgs->m_sIndex1;
+	}
 	ISphExpr * pExpr = sphExprParse ( m_szTok, m_tSchema, sError, tExprArgs );
 	if ( !pExpr )
 		return;
@@ -458,8 +477,7 @@ bool SortStateSetup_c::Setup ( CSphString & sError )
 
 //////////////////////////////////////////////////////////////////////////
 
-ESortClauseParseResult sphParseSortClause ( const CSphQuery & tQuery, const char * szClause, const ISphSchema & tSchema, ESphSortFunc & eFunc, CSphMatchComparatorState & tState,
-	CSphVector<ExtraSortExpr_t> & dExtraExprs, bool bComputeItems, CSphString & sError )
+ESortClauseParseResult sphParseSortClause ( const CSphQuery & tQuery, const char * szClause, const ISphSchema & tSchema, ESphSortFunc & eFunc, CSphMatchComparatorState & tState, CSphVector<ExtraSortExpr_t> & dExtraExprs, const JoinArgs_t * pJoinArgs, CSphString & sError )
 {
 	for ( auto & tAttr : tState.m_dAttrs )
 		tAttr = -1;
@@ -505,9 +523,19 @@ ESortClauseParseResult sphParseSortClause ( const CSphQuery & tQuery, const char
 			return SORT_CLAUSE_ERROR;
 		}
 		
-		SortStateSetup_c tSetup ( pTok, tTok, tState, dExtraExprs, iField, tSchema, tQuery );
+		SortStateSetup_c tSetup ( pTok, tTok, tState, dExtraExprs, iField, tSchema, tQuery, pJoinArgs );
 		if ( !tSetup.Setup(sError) )
 			return SORT_CLAUSE_ERROR;		
+	}
+
+	// fix for
+	// FACET attr ORDER BY COUNT(*)
+	// into
+	// FACET attr ORDER BY COUNT(*) DESC
+	if ( iField==0 && tQuery.m_bFacet )
+	{
+		tState.m_uAttrDesc |= 1;
+		iField++;
 	}
 
 	if ( iField==0 )

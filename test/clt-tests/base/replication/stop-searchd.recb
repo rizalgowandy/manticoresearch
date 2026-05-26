@@ -1,0 +1,3 @@
+––– input –––
+stdbuf -oL searchd --stopwait -c test/clt-tests/base/searchd-with-flexible-ports.conf > /dev/null
+––– output –––

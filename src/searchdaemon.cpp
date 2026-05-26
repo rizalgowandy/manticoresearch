@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -17,23 +17,11 @@
 #include "searchdaemon.h"
 #include "coroutine.h"
 
-#include <optional>
-
 #if _WIN32
 	#define USE_PSI_INTERFACE 1
+
 	// for MAC address
-
 	#include <iphlpapi.h>
-	#pragma message("Automatically linking with iphlpapi.lib")
-	#pragma comment(lib, "iphlpapi.lib")
-
-	#pragma comment(linker, "/defaultlib:WS2_32.Lib")
-	#pragma message("Automatically linking with WS2_32.Lib")
-
-	// socket function definitions
-	#pragma comment(linker, "/defaultlib:wsock32.lib")
-	#pragma message("Automatically linking with wsock32.lib")
-
 #else
 	#include <netdb.h>
 	// for MAC address
@@ -53,7 +41,7 @@
 #include <netinet/in.h>
 #endif
 
-#include <cmath>
+#include "config.h"
 
 /////////////////////////////////////////////////////////////////////////////
 // MISC GLOBALS
@@ -103,9 +91,9 @@ CheckLike::CheckLike( const char* sPattern )
 	*d = '\0';
 }
 
-bool CheckLike::Match( const char* sValue )
+bool CheckLike::Match ( const char* sValue ) const noexcept
 {
-	return sValue && ( m_sPattern.IsEmpty() || sphWildcardMatch( sValue, m_sPattern.cstr()));
+	return sValue && ( m_sPattern.IsEmpty() || sphWildcardMatch ( sValue, m_sPattern.cstr() ) );
 }
 
 // string vector with 'like' matcher
@@ -178,6 +166,19 @@ bool VectorLike::MatchAddf ( const char* sTemplate, ... )
 	return MatchAdd( sValue.cstr());
 }
 
+bool VectorLike::Matchf ( const char* sTemplate, ... ) const noexcept
+{
+	assert ( m_dHeadNames.GetLength() >= 1 );
+	va_list ap;
+	CSphString sValue;
+
+	va_start ( ap, sTemplate );
+	sValue.SetSprintfVa ( sTemplate, ap );
+	va_end ( ap );
+
+	return Match ( sValue.cstr() );
+}
+
 void VectorLike::Addf ( const char * sValueTmpl, ... )
 {
 	va_list ap;
@@ -247,18 +248,17 @@ void VectorLike::FillTail ( int iHas )
 }
 
 
-static const char * g_dIndexTypeName[1 + ( int ) IndexType_e::ERROR_] = {
-	"plain",
-	"template",
-	"rt",
-	"percolate",
-	"distributed",
-	"invalid"
-};
-
-CSphString GetTypeName( IndexType_e eType )
+const char* GetIndexTypeName ( IndexType_e eType )
 {
-	return g_dIndexTypeName[( int ) eType];
+	switch ( eType )
+	{
+	case IndexType_e::PLAIN : return "plain";
+	case IndexType_e::TEMPLATE: return "template";
+	case IndexType_e::RT: return "rt";
+	case IndexType_e::PERCOLATE: return "percolate";
+	case IndexType_e::DISTR: return "distributed";
+	default: return "invalid";
+	}
 }
 
 IndexType_e TypeOfIndexConfig( const CSphString& sType )
@@ -362,10 +362,8 @@ static bool ProtoByName ( CSphString sFullProto, ListenerDesc_t & tDesc, CSphStr
 	return false;
 }
 
-static const ListenerDesc_t g_tInvalidListener;
-
 /// listen = ( address ":" port | port | path | address ":" port start - port end ) [ ":" protocol ] [ "_vip" ]
-ListenerDesc_t ParseListener ( const char* sSpec, CSphString * pFatal )
+ListenerDesc_t ParseResolveListener ( const char* sSpec, bool bResolve, CSphString* pFatal )
 {
 	ListenerDesc_t tRes;
 	tRes.m_eProto = Proto_e::SPHINX;
@@ -382,7 +380,7 @@ ListenerDesc_t ParseListener ( const char* sSpec, CSphString * pFatal )
 	if ( iParts>3 )
 	{
 		MaybeFatalLog ( pFatal, "invalid listen format (too many fields)" );
-		return g_tInvalidListener;
+		return {};
 	}
 
 	assert ( iParts>=1 && iParts<=3 );
@@ -394,18 +392,18 @@ ListenerDesc_t ParseListener ( const char* sSpec, CSphString * pFatal )
 		if ( iParts>2 )
 		{
 			MaybeFatalLog ( pFatal, "invalid listen format (too many fields)" );
-			return g_tInvalidListener;
+			return {};
 		}
 
 		if ( iParts==2 && !ProtoByName ( dParts[1], tRes, pFatal ) )
-			return g_tInvalidListener;
+			return {};
 
 		tRes.m_sUnix = dParts[0];
 
 		// MOVED!!! check outside ParseListener in order to make tests consistent despite platforms
 #if _WIN32
 		MaybeFatalLog ( pFatal, "UNIX sockets are not supported on Windows" );
-		return g_tInvalidListener;
+		return {};
 #else
 		return tRes;
 #endif
@@ -425,7 +423,7 @@ ListenerDesc_t ParseListener ( const char* sSpec, CSphString * pFatal )
 	{
 		iPort = atol( sPart );
 		if ( !CheckPort ( iPort, pFatal ) ) // lets forbid ambiguous magic like 0:sphinx or 99999:mysql41
-			return g_tInvalidListener;
+			return {};
 	}
 
 	// handle TCP port case
@@ -440,9 +438,9 @@ ListenerDesc_t ParseListener ( const char* sSpec, CSphString * pFatal )
 		{
 			// host name on itself
 			tRes.m_sAddr = sSpec;
-			tRes.m_uIP = sphGetAddress ( sSpec, ( pFatal==nullptr ), false, pFatal );
+			tRes.m_uIP = bResolve ? sphGetAddress ( sSpec, ( pFatal==nullptr ), false, pFatal  ) : 0;
 			if ( pFatal && !pFatal->IsEmpty() )
-				return g_tInvalidListener;
+				return {};
 		}
 		return tRes;
 	}
@@ -454,18 +452,18 @@ ListenerDesc_t ParseListener ( const char* sSpec, CSphString * pFatal )
 		if ( iParts!=2 )
 		{
 			MaybeFatalLog ( pFatal, "invalid listen format (expected port:proto, got extra trailing part in listen=%s)", sSpec );
-			return g_tInvalidListener;
+			return {};
 		}
 
 		tRes.m_iPort = iPort;
 		if ( !ProtoByName ( dParts[1], tRes, pFatal ) )
-			return g_tInvalidListener;
+			return {};
 		return tRes;
 	}
 
-	// 1st part must be a host name; must be host:port[:proto]
+	// 1st part must be a host name; must be: host:port[:proto]
 	if ( iParts==3 && !ProtoByName ( dParts[2], tRes, pFatal ) )
-		return g_tInvalidListener;
+		return {};
 
 	if ( dParts[0].IsEmpty() )
 	{
@@ -473,39 +471,44 @@ ListenerDesc_t ParseListener ( const char* sSpec, CSphString * pFatal )
 	} else
 	{
 		tRes.m_sAddr = dParts[0];
-		tRes.m_uIP = sphGetAddress ( dParts[0].cstr(), ( pFatal==nullptr ), false, pFatal );
+		tRes.m_uIP = bResolve ? sphGetAddress ( dParts[0].cstr(), ( pFatal==nullptr ), false, pFatal ) : 0;
 		if ( pFatal && !pFatal->IsEmpty() )
-			return g_tInvalidListener;
+			return {};
 	}
 
 
 	auto dPorts = sphSplit( dParts[1].scstr(), "-" );
 	tRes.m_iPort = atoi( dPorts[0].cstr());
 	if ( !CheckPort( tRes.m_iPort, pFatal ) )
-		return g_tInvalidListener;
+		return {};
 
 	if ( dPorts.GetLength()==2 )
 	{
 		int iPortsEnd = atoi( dPorts[1].scstr() );
 		if ( !CheckPort ( iPortsEnd, pFatal ) )
-			return g_tInvalidListener;
+			return {};
 
 		int iPortsCount = iPortsEnd - tRes.m_iPort + 1;
 
 		if ( iPortsEnd<=tRes.m_iPort )
 		{
 			MaybeFatalLog ( pFatal, "ports range invalid %d-%d", tRes.m_iPort, iPortsEnd );
-			return g_tInvalidListener;
+			return {};
 		}
 		if ( iPortsCount<2 )
 		{
 			MaybeFatalLog( pFatal, "ports range %d-%d count should be at least 2, got %d", tRes.m_iPort, iPortsEnd, iPortsCount );
-			return g_tInvalidListener;
+			return {};
 		}
 
 		tRes.m_iPortsCount = iPortsCount;
 	}
 	return tRes;
+}
+
+ListenerDesc_t ParseListener ( const char* sSpec, CSphString* pFatal )
+{
+	return ParseResolveListener ( sSpec, true, pFatal );
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -658,6 +661,10 @@ int sphPoll( int iSock, int64_t tmTimeout, bool bWrite )
 #endif
 }
 
+static bool IsLocalhost ( DWORD uAddr )
+{
+	return ( ( ntohl ( uAddr )>>24)==127 );
+}
 
 DWORD sphGetAddress ( const char * sHost, bool bFatal, bool bIP, CSphString * pFatal )
 {
@@ -673,11 +680,11 @@ DWORD sphGetAddress ( const char * sHost, bool bFatal, bool bIP, CSphString * pF
 	if ( iResult!=0 || !pResult )
 	{
 		if ( pFatal )
-			pFatal->SetSprintf ( "no AF_INET address found for: %s", sHost );
+			pFatal->SetSprintf ( "no AF_INET address found for: %s, error %d: %s", sHost, iResult, gai_strerror(iResult) );
 		else if ( bFatal )
-			sphFatal( "no AF_INET address found for: %s", sHost );
+			sphFatal( "no AF_INET address found for: %s, error %d: %s", sHost, iResult, gai_strerror(iResult) );
 		else
-			sphLogDebugv( "no AF_INET address found for: %s", sHost );
+			sphLogDebugv( "no AF_INET address found for: %s, error %d: %s", sHost, iResult, gai_strerror(iResult) );
 		return 0;
 	}
 
@@ -687,24 +694,24 @@ DWORD sphGetAddress ( const char * sHost, bool bFatal, bool bIP, CSphString * pF
 
 	if ( pResult->ai_next )
 	{
-		DWORD uLocalhost = htonl ( INADDR_LOOPBACK );
-		char sAddrBuf[SPH_ADDRESS_SIZE+1];
+		const bool bLocalHost = IsLocalhost ( uAddr );
+		std::array<char, SPH_ADDRESS_SIZE + 1> sAddrBuf{};
 		StringBuilder_c sBuf( "; ip=", "ip=" );
 
 		while ( pResult )
 		{
 			auto * pAddr = ( struct sockaddr_in *)pResult->ai_addr;
 			DWORD uNextAddr = pAddr->sin_addr.s_addr;
-			sphFormatIP( sAddrBuf, sizeof( sAddrBuf ), uNextAddr );
-			sBuf += sAddrBuf; // can not use << as builder appends string buffer with tail '\0' and next chunks are invisible
+			sphFormatIP( sAddrBuf.data(), sAddrBuf.size(), uNextAddr );
+			sBuf += sAddrBuf.data(); // can not use << as builder appends string buffer with tail '\0' and next chunks are invisible
 			pResult = pResult->ai_next;
 
-			if ( uAddr==uLocalhost && uNextAddr!=uLocalhost )
+			if ( bLocalHost && !IsLocalhost ( uNextAddr ) )
 				uAddr = uNextAddr;
 		}
 
-		sphFormatIP( sAddrBuf, sizeof( sAddrBuf ), uAddr );
-		sphWarning( "multiple addresses (%s) found for '%s', using first one (%s)", sBuf.cstr(), sHost, sAddrBuf );
+		sphFormatIP( sAddrBuf.data(), sAddrBuf.size(), uAddr );
+		sphWarning( "multiple addresses (%s) found for '%s', using first one (%s)", sBuf.cstr(), sHost, sAddrBuf.data() );
 	}
 
 	return uAddr;
@@ -978,9 +985,11 @@ bool InputBuffer_c::IsDataSizeValid ( int iSize )
 	if ( !IsLessMaxPacket ( iSize ) )
 	{
 		return false;
-	} else if ( m_pCur + iSize>m_pBuf + m_iLen )
+	}
+
+	if ( m_pCur + iSize>m_pBuf + m_iLen )
 	{
-		SetError( "read overflows buffer by %d byte, data size %d", (int)( ( m_pCur + iSize ) - ( m_pBuf + m_iLen ) ), iSize );
+		SetError( "read overflows buffer by %d byte, data size %d", (int)( m_pCur + iSize - ( m_pBuf + m_iLen ) ), iSize );
 		return false;
 	}
 
@@ -993,9 +1002,9 @@ bool InputBuffer_c::IsLessMaxPacket ( int iSize )
 	{
 		SetError( "negative data length %d", iSize );
 		return false;
-	} else if ( iSize>g_iMaxPacketSize )
+	} else if ( iSize>m_iMaxPacketSize )
 	{
-		SetError( "length out of bounds %d(%d)", iSize, g_iMaxPacketSize );
+		SetError( "length out of bounds %d(%d)", iSize, m_iMaxPacketSize );
 		return false;
 	}
 
@@ -1014,191 +1023,29 @@ void GenericOutputBuffer_c::ResetError()
 	m_sError = "";
 }
 
+void InputBuffer_c::SetMaxPacketSize( int iMaxPacketSize )
+{
+	m_iMaxPacketSize = Max ( g_iMaxPacketSize, iMaxPacketSize );
+}
+
 /////////////////////////////////////////////////////////////////////////////
 // SERVED INDEX DESCRIPTORS STUFF
 /////////////////////////////////////////////////////////////////////////////
 
-
-class QueryStatContainer_c: public QueryStatContainer_i
-{
-public:
-	void Add( uint64_t uFoundRows, uint64_t uQueryTime, uint64_t uTimestamp ) final;
-	void GetRecord( int iRecord, QueryStatRecord_t& tRecord ) const final;
-	int GetNumRecords() const final;
-
-	QueryStatContainer_c();
-	QueryStatContainer_c( QueryStatContainer_c&& tOther ) noexcept;
-	void Swap( QueryStatContainer_c& rhs ) noexcept;
-	QueryStatContainer_c& operator=( QueryStatContainer_c tOther ) noexcept;
-
-private:
-	CircularBuffer_T<QueryStatRecord_t> m_dRecords;
-};
-
-void QueryStatContainer_c::Add( uint64_t uFoundRows, uint64_t uQueryTime, uint64_t uTimestamp )
-{
-	if ( !m_dRecords.IsEmpty())
-	{
-		QueryStatRecord_t& tLast = m_dRecords.Last();
-		const uint64_t BUCKET_TIME_DELTA = 100000;
-		if ( uTimestamp - tLast.m_uTimestamp<=BUCKET_TIME_DELTA )
-		{
-			tLast.m_uFoundRowsMin = Min( uFoundRows, tLast.m_uFoundRowsMin );
-			tLast.m_uFoundRowsMax = Max( uFoundRows, tLast.m_uFoundRowsMax );
-			tLast.m_uFoundRowsSum += uFoundRows;
-
-			tLast.m_uQueryTimeMin = Min( uQueryTime, tLast.m_uQueryTimeMin );
-			tLast.m_uQueryTimeMax = Max( uQueryTime, tLast.m_uQueryTimeMax );
-			tLast.m_uQueryTimeSum += uQueryTime;
-
-			tLast.m_iCount++;
-
-			return;
-		}
-	}
-
-	const uint64_t MAX_TIME_DELTA = 15 * 60 * 1000000;
-	while ( !m_dRecords.IsEmpty() && ( uTimestamp - m_dRecords[0].m_uTimestamp )>MAX_TIME_DELTA )
-		m_dRecords.Pop();
-
-	QueryStatRecord_t& tRecord = m_dRecords.Push();
-	tRecord.m_uFoundRowsMin = uFoundRows;
-	tRecord.m_uFoundRowsMax = uFoundRows;
-	tRecord.m_uFoundRowsSum = uFoundRows;
-
-	tRecord.m_uQueryTimeMin = uQueryTime;
-	tRecord.m_uQueryTimeMax = uQueryTime;
-	tRecord.m_uQueryTimeSum = uQueryTime;
-
-	tRecord.m_uTimestamp = uTimestamp;
-	tRecord.m_iCount = 1;
-}
-
-void QueryStatContainer_c::GetRecord( int iRecord, QueryStatRecord_t& tRecord ) const
-{
-	tRecord = m_dRecords[iRecord];
-}
-
-
-int QueryStatContainer_c::GetNumRecords() const
-{
-	return m_dRecords.GetLength();
-}
-
-QueryStatContainer_c::QueryStatContainer_c() = default;
-
-QueryStatContainer_c::QueryStatContainer_c( QueryStatContainer_c&& tOther ) noexcept
-	: QueryStatContainer_c()
-{ Swap( tOther ); }
-
-void QueryStatContainer_c::Swap( QueryStatContainer_c& rhs ) noexcept
-{
-	rhs.m_dRecords.Swap( m_dRecords );
-}
-
-QueryStatContainer_c& QueryStatContainer_c::operator=( QueryStatContainer_c tOther ) noexcept
-{
-	Swap( tOther );
-	return *this;
-}
-
-//////////////////////////////////////////////////////////////////////////
-
-#ifndef NDEBUG
-
-class QueryStatContainerExact_c: public QueryStatContainer_i
-{
-public:
-	void Add( uint64_t uFoundRows, uint64_t uQueryTime, uint64_t uTimestamp ) final;
-	void GetRecord( int iRecord, QueryStatRecord_t& tRecord ) const final;
-	int GetNumRecords() const final;
-
-	QueryStatContainerExact_c();
-	QueryStatContainerExact_c( QueryStatContainerExact_c&& tOther ) noexcept;
-	void Swap( QueryStatContainerExact_c& rhs ) noexcept;
-	QueryStatContainerExact_c& operator=( QueryStatContainerExact_c tOther ) noexcept;
-
-private:
-	struct QueryStatRecordExact_t
-	{
-		uint64_t m_uQueryTime;
-		uint64_t m_uFoundRows;
-		uint64_t m_uTimestamp;
-	};
-
-	CircularBuffer_T<QueryStatRecordExact_t> m_dRecords;
-};
-
-void QueryStatContainerExact_c::Add( uint64_t uFoundRows, uint64_t uQueryTime, uint64_t uTimestamp )
-{
-	const uint64_t MAX_TIME_DELTA = 15 * 60 * 1000000;
-	while ( !m_dRecords.IsEmpty() && ( uTimestamp - m_dRecords[0].m_uTimestamp )>MAX_TIME_DELTA )
-		m_dRecords.Pop();
-
-	QueryStatRecordExact_t& tRecord = m_dRecords.Push();
-	tRecord.m_uFoundRows = uFoundRows;
-	tRecord.m_uQueryTime = uQueryTime;
-	tRecord.m_uTimestamp = uTimestamp;
-}
-
-
-int QueryStatContainerExact_c::GetNumRecords() const
-{
-	return m_dRecords.GetLength();
-}
-
-
-void QueryStatContainerExact_c::GetRecord( int iRecord, QueryStatRecord_t& tRecord ) const
-{
-	const QueryStatRecordExact_t& tExact = m_dRecords[iRecord];
-
-	tRecord.m_uQueryTimeMin = tExact.m_uQueryTime;
-	tRecord.m_uQueryTimeMax = tExact.m_uQueryTime;
-	tRecord.m_uQueryTimeSum = tExact.m_uQueryTime;
-	tRecord.m_uFoundRowsMin = tExact.m_uFoundRows;
-	tRecord.m_uFoundRowsMax = tExact.m_uFoundRows;
-	tRecord.m_uFoundRowsSum = tExact.m_uFoundRows;
-
-	tRecord.m_uTimestamp = tExact.m_uTimestamp;
-	tRecord.m_iCount = 1;
-}
-
-QueryStatContainerExact_c::QueryStatContainerExact_c() = default;
-
-QueryStatContainerExact_c::QueryStatContainerExact_c( QueryStatContainerExact_c&& tOther ) noexcept
-	: QueryStatContainerExact_c()
-{ Swap( tOther ); }
-
-void QueryStatContainerExact_c::Swap( QueryStatContainerExact_c& rhs ) noexcept
-{
-	rhs.m_dRecords.Swap( m_dRecords );
-}
-
-QueryStatContainerExact_c& QueryStatContainerExact_c::operator=( QueryStatContainerExact_c tOther ) noexcept
-{
-	Swap( tOther );
-	return *this;
-}
-
-#endif
-
-
-//////////////////////////////////////////////////////////////////////////
 ServedStats_c::ServedStats_c()
-	: m_pQueryStatRecords { std::make_unique<QueryStatContainer_c>() }
+	: m_pQueryStatRecords { MakeStatsContainer() }
 #ifndef NDEBUG
-	, m_pQueryStatRecordsExact { std::make_unique<QueryStatContainerExact_c>() }
+	, m_pQueryStatRecordsExact { MakeExactStatsContainer() }
 #endif
-	, m_pQueryTimeDigest { sphCreateTDigest() }
-	, m_pRowsFoundDigest { sphCreateTDigest() }
+
 {}
 
 void ServedStats_c::AddQueryStat( uint64_t uFoundRows, uint64_t uQueryTime )
 {
 	ScWL_t wLock( m_tStatsLock );
 
-	m_pRowsFoundDigest->Add(( double ) uFoundRows );
-	m_pQueryTimeDigest->Add(( double ) uQueryTime );
+	m_tRowsFoundDigest.Add(( double ) uFoundRows );
+	m_tQueryTimeDigest.Add(( double ) uQueryTime );
 
 	uint64_t uTimeStamp = sphMicroTimer();
 	m_pQueryStatRecords->Add( uFoundRows, uQueryTime, uTimeStamp );
@@ -1215,9 +1062,11 @@ void ServedStats_c::AddQueryStat( uint64_t uFoundRows, uint64_t uQueryTime )
 	m_uTotalQueryTimeMax = Max( uQueryTime, m_uTotalQueryTimeMax );
 	m_uTotalQueryTimeSum += uQueryTime;
 
+	m_tCommandsStats.AddDeltaDetailed ( CommandStats_t::eSearch, uFoundRows, uQueryTime );
+	m_tCommandsStats.Inc ( SEARCHD_COMMAND_SEARCH );
+
 	++m_uTotalQueries;
 }
-
 
 static const uint64_t g_dStatsIntervals[] =
 	{
@@ -1245,8 +1094,7 @@ void ServedStats_c::CalculateQueryStatsExact( QueryStats_t& tRowsFoundStats, Que
 #endif // !NDEBUG
 
 
-void ServedStats_c::CalcStatsForInterval( const QueryStatContainer_i* pContainer, QueryStatElement_t& tRowResult,
-	QueryStatElement_t& tTimeResult, uint64_t uTimestamp, uint64_t uInterval, int iRecords )
+static void CalcStatsForInterval( const QueryStatContainer_i* pContainer, QueryStatElement_t& tRowResult, QueryStatElement_t& tTimeResult, uint64_t uTimestamp, uint64_t uInterval, int iRecords )
 {
 	assert ( pContainer );
 	using namespace QueryStats;
@@ -1264,12 +1112,10 @@ void ServedStats_c::CalcStatsForInterval( const QueryStatContainer_i* pContainer
 	dTime.Reserve( iRecords );
 
 	DWORD uTotalQueries = 0;
-	QueryStatRecord_t tRecord;
 
 	for ( int i = 0; i<pContainer->GetNumRecords(); ++i )
 	{
-		pContainer->GetRecord( i, tRecord );
-
+		auto tRecord = pContainer->GetRecord ( i );
 		if ( uTimestamp - tRecord.m_uTimestamp<=uInterval )
 		{
 			tRowResult.m_dData[TYPE_MIN] = Min( tRecord.m_uFoundRowsMin, tRowResult.m_dData[TYPE_MIN] );
@@ -1309,8 +1155,18 @@ void ServedStats_c::CalcStatsForInterval( const QueryStatContainer_i* pContainer
 	tTimeResult.m_dData[TYPE_99] = dTime[u99];
 }
 
-void ServedStats_c::DoStatCalcStats( const QueryStatContainer_i* pContainer,
-	QueryStats_t& tRowsFoundStats, QueryStats_t& tQueryTimeStats ) const
+void CalcSimpleStats ( const QueryStatContainer_i * pContainer, QueryStats_t & tRowsFoundStats, QueryStats_t & tQueryTimeStats )
+{
+	assert ( pContainer );
+	using namespace QueryStats;
+	auto uTimestamp = sphMicroTimer ();
+	int iRecords = pContainer->GetNumRecords ();
+	for ( int i = INTERVAL_1MIN; i<=INTERVAL_15MIN; ++i )
+		CalcStatsForInterval ( pContainer, tRowsFoundStats.m_dStats[i], tQueryTimeStats.m_dStats[i], uTimestamp, g_dStatsIntervals[i], iRecords );
+}
+
+
+void ServedStats_c::DoStatCalcStats( const QueryStatContainer_i* pContainer, QueryStats_t& tRowsFoundStats, QueryStats_t& tQueryTimeStats ) const
 {
 	assert ( pContainer );
 	using namespace QueryStats;
@@ -1319,24 +1175,44 @@ void ServedStats_c::DoStatCalcStats( const QueryStatContainer_i* pContainer,
 
 	int iRecords = m_pQueryStatRecords->GetNumRecords();
 	for ( int i = INTERVAL_1MIN; i<=INTERVAL_15MIN; ++i )
-		CalcStatsForInterval( pContainer, tRowsFoundStats.m_dStats[i], tQueryTimeStats.m_dStats[i], uTimestamp,
-							  g_dStatsIntervals[i], iRecords );
+		CalcStatsForInterval( pContainer, tRowsFoundStats.m_dStats[i], tQueryTimeStats.m_dStats[i], uTimestamp, g_dStatsIntervals[i], iRecords );
 
 	auto& tRowsAllStats = tRowsFoundStats.m_dStats[INTERVAL_ALLTIME];
 	tRowsAllStats.m_dData[TYPE_AVG] = m_uTotalQueries ? m_uTotalFoundRowsSum / m_uTotalQueries : 0;
 	tRowsAllStats.m_dData[TYPE_MIN] = m_uTotalFoundRowsMin;
 	tRowsAllStats.m_dData[TYPE_MAX] = m_uTotalFoundRowsMax;
-	tRowsAllStats.m_dData[TYPE_95] = ( uint64_t ) m_pRowsFoundDigest->Percentile( 95 );
-	tRowsAllStats.m_dData[TYPE_99] = ( uint64_t ) m_pRowsFoundDigest->Percentile( 99 );
+	tRowsAllStats.m_dData[TYPE_95] = ( uint64_t ) m_tRowsFoundDigest.Percentile( 95 );
+	tRowsAllStats.m_dData[TYPE_99] = ( uint64_t ) m_tRowsFoundDigest.Percentile( 99 );
 	tRowsAllStats.m_uTotalQueries = m_uTotalQueries;
 
 	auto& tQueryAllStats = tQueryTimeStats.m_dStats[INTERVAL_ALLTIME];
 	tQueryAllStats.m_dData[TYPE_AVG] = m_uTotalQueries ? m_uTotalQueryTimeSum / m_uTotalQueries : 0;
 	tQueryAllStats.m_dData[TYPE_MIN] = m_uTotalQueryTimeMin;
 	tQueryAllStats.m_dData[TYPE_MAX] = m_uTotalQueryTimeMax;
-	tQueryAllStats.m_dData[TYPE_95] = ( uint64_t ) m_pQueryTimeDigest->Percentile( 95 );
-	tQueryAllStats.m_dData[TYPE_99] = ( uint64_t ) m_pQueryTimeDigest->Percentile( 99 );
+	tQueryAllStats.m_dData[TYPE_95] = ( uint64_t ) m_tQueryTimeDigest.Percentile( 95 );
+	tQueryAllStats.m_dData[TYPE_99] = ( uint64_t ) m_tQueryTimeDigest.Percentile( 99 );
 	tQueryAllStats.m_uTotalQueries = m_uTotalQueries;
+}
+
+void ServedStats_c::AddWriteStat ( CommandStats_t::EDETAILS eCmd, bool bReplace, uint64_t uRows, uint64_t tmStart )
+{
+	m_tCommandsStats.AddDetailed ( eCmd, uRows, tmStart );
+	switch ( eCmd )
+	{
+	case CommandStats_t::eUpdate:
+		m_tCommandsStats.Inc ( SEARCHD_COMMAND_UPDATE );
+		break;
+	case CommandStats_t::eReplace:
+		m_tCommandsStats.Inc ( bReplace ? SEARCHD_COMMAND_REPLACE : SEARCHD_COMMAND_INSERT );
+		break;
+
+	default: break;
+	}
+}
+
+void ServedStats_c::IncCmd ( SearchdCommand_e eCmd )
+{
+	m_tCommandsStats.Inc ( eCmd );
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -1397,6 +1273,26 @@ void ServedIndex_c::SetUnlink ( CSphString sUnlink ) const
 {
 	if ( m_pIndex )
 		m_pIndex->m_sUnlink = std::move ( sUnlink );
+}
+
+void ServedIndex_c::LockRead() const noexcept
+{
+	m_tTableLock.WaitRead();
+}
+
+[[nodiscard]] bool ServedIndex_c::UnlockRead() const noexcept
+{
+	return m_tTableLock.UnlockRead();
+}
+
+[[nodiscard]] DWORD ServedIndex_c::GetReadLocks() const noexcept
+{
+	return m_tTableLock.GetReads();
+}
+
+[[nodiscard]] Threads::Coro::ReadTableLock_c& ServedIndex_c::Locker() const noexcept
+{
+	return m_tTableLock;
 }
 
 void LightClone ( ServedIndexRefPtr_c& pTarget, const cServedIndexRefPtr_c& pSource )
@@ -1584,4 +1480,19 @@ volatile bool& sphGetSeamlessRotate() noexcept
 	static bool bSeamlessRotate = true;
 #endif
 	return bSeamlessRotate;
+}
+
+bool PollOptimizeRunning ( const CSphString & sIndex )
+{
+	while ( true )
+	{
+		Threads::Coro::SleepMsec ( 500 );
+		auto pTmpIndex = GetServed ( sIndex );
+		if ( !ServedDesc_t::IsMutable ( pTmpIndex ) )
+			return false;
+
+		RIdx_T<RtIndex_i *> pRtIndex { pTmpIndex };
+		if ( !pRtIndex->OptimizesRunning () )
+			return true;
+	}
 }

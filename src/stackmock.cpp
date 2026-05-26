@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2017-2023, Manticore Software LTD (https://manticoresearch.com)
+// Copyright (c) 2017-2026, Manticore Software LTD (https://manticoresearch.com)
 // Copyright (c) 2001-2016, Andrew Aksyonoff
 // Copyright (c) 2008-2016, Sphinx Technologies Inc
 // All rights reserved
@@ -16,6 +16,8 @@
 #include "coroutine.h"
 #include "searchdsql.h"
 #include "attribute.h"
+#include "querycontext.h"
+#include "sphinxquery/xqparser.h"
 
 // hard-coded definitions to avoid probing (that is - to avoid confusing memcheck programs)
 // run searchd with --logdebug --console once, read values, then write them here and uncomment these lines
@@ -30,21 +32,21 @@ protected:
 	int m_iComplexity;
 
 protected:
-	int CalcUsedStackEdge ( BYTE uFiller )
+	DWORD CalcUsedStackEdge ( BYTE uFiller )
 	{
 		ARRAY_CONSTFOREACH ( i, m_dMockStack )
 			if ( m_dMockStack[i]!=uFiller )
-				return m_dMockStack.GetLength ()-i;
+				return m_dMockStack.GetULength()-i;
 
-		return m_dMockStack.GetLength ();
+		return m_dMockStack.GetULength ();
 	}
 
-	void MockInitMem ( BYTE uFiller )
+	ATTRIBUTE_NO_SANITIZE_ADDRESS void MockInitMem ( BYTE uFiller )
 	{
 		::memset ( m_dMockStack.begin (), uFiller, m_dMockStack.GetLengthBytes () );
 	}
 
-	int MeasureStackWithPattern ( BYTE uPattern )
+	DWORD MeasureStackWithPattern ( BYTE uPattern )
 	{
 		MockInitMem ( uPattern );
 		MockParseTest ();
@@ -52,7 +54,7 @@ protected:
 		return sphRoundUp ( iUsedStackEdge, 4 );
 	}
 
-	int MeasureStack ()
+	DWORD MeasureStack ()
 	{
 		auto iStartStackDE = MeasureStackWithPattern ( 0xDE );
 		auto iStartStackAD = MeasureStackWithPattern ( 0xAD );
@@ -69,34 +71,83 @@ protected:
 	}
 
 public:
-	int MockMeasureStack ( int iNodes )
+	ATTRIBUTE_NO_SANITIZE_ADDRESS StackSizeTuplet_t MockMeasureStack ()
 	{
-		BuildMockExprWrapper ( 0 );
+		StringBuilder_c sLog;
+		constexpr int iMeasures = 50;
+		DWORD uDepth = 0;
+		BuildMockExprWrapper ( uDepth );
+		auto uStartingStack = MeasureStack ();
+		sphLogDebugv( "========= start measure ==============" );
+		sLog.Sprintf( "height 0, stack %d, deltah %d, deltastack %d", uStartingStack, 0, uStartingStack );
+		sphLogDebugv( "height 0, stack %d, deltah %d, deltastack %d", uStartingStack, 0, uStartingStack );
 
-		int iStartStack = MeasureStack ();
-		int iDelta = 0;
-
-		// Find edge of stack where expr length became visible
-		// (we need quite big expr in order to touch deepest of the stack)
-		int iHeight = 0;
-		while ( iDelta<=0 )
+		DWORD i = 1;
+		CSphVector<std::pair<int,int>> dHistogram;
+		auto IncValue = [&dHistogram] ( int i ) {
+			for ( auto& pair : dHistogram ) { // expected 2..5 elements; so linear search is perfect here.
+				if ( pair.first != i )
+					continue;
+				++pair.second;
+				return pair.second;
+			}
+			dHistogram.Add({i,1});
+			return 1;
+		};
+		DWORD uPreviousStack = uStartingStack;
+		DWORD uPreviousDepth = uDepth;
+		while ( i<iMeasures )
 		{
-			++iHeight;
-			BuildMockExprWrapper ( iHeight );
-			auto iCurStack = MeasureStack ();
-			iDelta = iCurStack - iStartStack;
+			BuildMockExprWrapper ( ++uDepth );
+			auto uThisStack = MeasureStack ();
+			if ( uThisStack == uPreviousStack )
+				continue;
+
+			int iDelta = uThisStack - uPreviousStack;
+			DWORD uDeltaDepth = uDepth - uPreviousDepth;
+			uPreviousStack = uThisStack;
+			uPreviousDepth = uDepth;
+			sphLogDebugv( "height %d, stack %d, deltah %d, deltastack %d", uDepth, uThisStack, uDeltaDepth, iDelta );
+			sLog.Sprintf( "%d: %d: %d: %d", uDepth, uThisStack, uDeltaDepth, iDelta );
+			++i;
+			if ( uDeltaDepth==1 && iDelta>0 )
+			{
+				auto iMaxTries = IncValue ( iDelta );
+				const auto iRestTries = iMeasures - i;
+				if ( iMaxTries>iRestTries ) // we may stop here, if continuing will definitely give us nothing better
+				{
+					if ( dHistogram.GetLength()==1)
+						break;
+					dHistogram.Sort ( Lesser ( [] ( auto l, auto r ) { return l.second>r.second; } ) );
+					if ( iMaxTries > (iRestTries + dHistogram[1].second) )
+						break;
+				}
+			}
+			const int iRestStack = m_dMockStack.GetLengthBytes() - uPreviousStack;
+			if ( iDelta >= iRestStack )
+				break;
 		}
 
-		iStartStack += iDelta;
+		dHistogram.Sort ( Lesser ( [] ( auto l, auto r ) { return l.second>r.second; } ) );
+		sphLogDebugv( "Performed %d measures out of %d, max depth %d", i, iMeasures, uDepth );
+		sLog.Sprintf( "Performed %d measures out of %d, max depth %d", i, iMeasures, uDepth );
+		for ( const auto& pair : dHistogram )
+		{
+			sphLogDebugv( "stack frame size %d, frames %d", pair.first, pair.second );
+			sLog.Sprintf( "stack frame size %d, frames %d", pair.first, pair.second );
+		}
 
-		// add iNodes frames and average stack from them
-		BuildMockExprWrapper ( iHeight + iNodes );
+		if ( dHistogram.IsEmpty() )
+		{
+			sphWarning ("Something wrong measuring stack. After %d tries, %d depth", i, uDepth );
+			sphWarning ("log: %s", sLog.cstr());
+		}
 
-		auto iCurStack = MeasureStack ();
-		iDelta = iCurStack-iStartStack;
-		iDelta/=iNodes;
-		iDelta = sphRoundUp ( iDelta, 16 );
-		return iDelta;
+		auto iStack = dHistogram.First().first;
+		assert (iStack>0);
+
+		int iDelta = sphRoundUp ( iStack, 8 );
+		return { (int)uStartingStack, iDelta };
 	}
 
 	virtual ~StackMeasurer_c () = default;
@@ -104,18 +155,25 @@ public:
 
 /////////////////////////////////////////////////////////////////////
 /// calculate stack for expressions
-class CreateExprStackSize_c : public StackMeasurer_c
+class CreateExprStackSize_c final : public StackMeasurer_c
 {
 	void BuildMockExpr ( int iComplexity ) final
 	{
 		m_sExpr.Clear();
-		m_sExpr << "((attr_a=0)*1)";
+		m_sExpr << "IF(attr_a IN(0,1),10,";
 
-		for ( int i = 1; i<iComplexity+1; ++i ) // ((attr_a=0)*1) + ((attr_b=1)*3) + ((attr_b=2)*5) + ...
-			m_sExpr << "+((attr_b=" << i << ")*" << i * 2+1 << ")";
+		for ( int i = 1; i<iComplexity+1; ++i )
+			m_sExpr << "IF(attr_a IN(" << i << "," << i+1 << ")," << (i+1)*10 << ",";
+		m_sExpr << (iComplexity+2)*10 << ")";
+		for ( int i = 0; i<iComplexity; ++i )
+			m_sExpr << ")";
+
+		//IF(a IN(0,1),10,20)
+		//IF(a IN(0,1),10,IF(a IN(1,2),20,30))
+		//IF(a IN(0,1),10,IF(a IN(1,2),20,IF(a IN(2,3),30,40))) ...
 	}
 
-	void MockParseTest () override
+	ATTRIBUTE_NO_SANITIZE_ADDRESS void MockParseTest () final
 	{
 		struct
 		{
@@ -131,8 +189,6 @@ class CreateExprStackSize_c : public StackMeasurer_c
 		tAttr.m_eAttrType = SPH_ATTR_INTEGER;
 		tAttr.m_sName = "attr_a";
 		tParams.m_tSchema.AddAttr ( tAttr, false );
-		tAttr.m_sName = "attr_b";
-		tParams.m_tSchema.AddAttr ( tAttr, false );
 
 		tParams.m_sExpr = m_sExpr.cstr();
 
@@ -147,17 +203,109 @@ class CreateExprStackSize_c : public StackMeasurer_c
 			sphWarning ( "stack check expression error: %s", tParams.m_sError.cstr () );
 	}
 
-protected:
 	StringBuilder_c m_sExpr;
 
 public:
-	static int MockMeasure();
-	static void PublishValue (int iStack);
+	static StackSizeTuplet_t MockMeasure();
+	static void PublishValue ( StackSizeTuplet_t tStack )
+	{
+		SetExprNodeParseStackItemSize ( { tStack.m_iCreate, tStack.m_iEval } );
+	}
+	static constexpr const char* szReport = "expression stack for creation";
+	static constexpr const char* szEnv = "KNOWN_CREATE_SIZE";
 };
 
 // measure stack for evaluate expression
-class EvalExprStackSize_c : public CreateExprStackSize_c
+class EvalExprStackSize_c final : public StackMeasurer_c
 {
+	StringBuilder_c m_sExpr;
+
+	void BuildMockExpr ( int iComplexity ) final
+	{
+		m_sExpr.Clear ();
+		m_sExpr << "((attr_a=0)*1)";
+
+		for ( int i = 1; i<iComplexity+1; ++i )
+			m_sExpr << " or attr_b in (" << i << ")"; // ((attr_a=0)*1) or attr_b in (1) or attr_b in (2) ...
+	}
+
+	void MockParseTest () final
+	{
+		struct
+		{
+			ExprParseArgs_t m_tArgs;
+			CSphString m_sError;
+			CSphSchema m_tSchema;
+			const char * m_sExpr = nullptr;
+			bool m_bSuccess = false;
+			ISphExpr * m_pExprBase = nullptr;
+			CSphMatch m_tMatch;
+		} tParams;
+
+		CSphColumnInfo tAttr;
+		tAttr.m_eAttrType = SPH_ATTR_INTEGER;
+		tAttr.m_sName = "attr_a";
+		tParams.m_tSchema.AddAttr ( tAttr, false );
+		tAttr.m_sName = "attr_b";
+		tParams.m_tSchema.AddAttr ( tAttr, false );
+
+		CSphFixedVector<CSphRowitem> dRow { tParams.m_tSchema.GetRowSize () };
+		auto * pRow = dRow.Begin();
+		for ( int i = 1; i<tParams.m_tSchema.GetAttrsCount (); ++i )
+			sphSetRowAttr ( pRow, tParams.m_tSchema.GetAttr ( i ).m_tLocator, i );
+		sphSetRowAttr ( pRow, tParams.m_tSchema.GetAttr ( 0 ).m_tLocator, 123 );
+
+		tParams.m_tMatch.m_tRowID = 123;
+		tParams.m_tMatch.m_iWeight = 456;
+		tParams.m_tMatch.m_pStatic = pRow;
+
+		tParams.m_sExpr = m_sExpr.cstr();
+		auto iStack = m_dMockStack.GetLengthBytes64 ();
+
+		{ // parse in dedicated coro (hope, 100K frame per level should fit any arch)
+			CSphFixedVector<BYTE> dSafeStack { iStack };
+			Threads::MockCallCoroutine ( dSafeStack, [&tParams] {	// do in coro as for fat expr it might already require dedicated stack
+				tParams.m_pExprBase = sphExprParse ( tParams.m_sExpr, tParams.m_tSchema, tParams.m_sError, tParams.m_tArgs );
+			});
+			tParams.m_bSuccess = !!tParams.m_pExprBase;
+			assert ( tParams.m_pExprBase );
+			tParams.m_pExprBase->Eval ( tParams.m_tMatch );
+		}
+
+		Threads::MockCallCoroutine ( m_dMockStack, [&tParams] {
+			tParams.m_pExprBase->Release ();
+		} );
+
+		if ( !tParams.m_bSuccess || !tParams.m_sError.IsEmpty () )
+			sphWarning ( "stack check expression error: %s", tParams.m_sError.cstr () );
+	}
+
+public:
+	static StackSizeTuplet_t MockMeasure();
+	static void PublishValue ( StackSizeTuplet_t tStack )
+	{
+		SetExprNodeEvalStackItemSize ( { tStack.m_iCreate, tStack.m_iEval } );
+	}
+
+	static constexpr const char * szReport = "expression stack for evaluation";
+	static constexpr const char * szEnv = "KNOWN_EXPR_SIZE";
+
+};
+
+// measure stack for evaluate expression
+class DeleteExprStackSize_c final : public StackMeasurer_c
+{
+	StringBuilder_c m_sExpr;
+
+	void BuildMockExpr ( int iComplexity ) final
+	{
+		m_sExpr.Clear ();
+		m_sExpr << "((attr_a=0)*1)";
+
+		for ( int i = 1; i<iComplexity+1; ++i ) // ((attr_a=0)*1) + ((attr_b=1)*3) + ((attr_b=2)*5) + ...
+			m_sExpr << "+((attr_b=" << i << ")*" << i*2+1 << ")";
+	}
+
 	void MockParseTest () override
 	{
 		struct
@@ -189,12 +337,13 @@ class EvalExprStackSize_c : public CreateExprStackSize_c
 		tParams.m_tMatch.m_pStatic = pRow;
 
 		tParams.m_sExpr = m_sExpr.cstr();
+		auto iStack = m_dMockStack.GetLengthBytes64 ();
 
 		{ // parse in dedicated coro (hope, 100K frame per level should fit any arch)
-		CSphFixedVector<BYTE> dSafeStack { m_iComplexity * 100 * 1024 };
-		Threads::MockCallCoroutine ( dSafeStack, [&tParams] {	// do in coro as for fat expr it might already require dedicated stack
-			tParams.m_pExprBase = sphExprParse ( tParams.m_sExpr, tParams.m_tSchema, tParams.m_sError, tParams.m_tArgs );
-		});
+			CSphFixedVector<BYTE> dSafeStack { iStack };
+			Threads::MockCallCoroutine ( dSafeStack, [&tParams] {	// do in coro as for fat expr it might already require dedicated stack
+				tParams.m_pExprBase = sphExprParse ( tParams.m_sExpr, tParams.m_tSchema, tParams.m_sError, tParams.m_tArgs );
+			});
 		}
 
 		tParams.m_bSuccess = !!tParams.m_pExprBase;
@@ -209,8 +358,14 @@ class EvalExprStackSize_c : public CreateExprStackSize_c
 	}
 
 public:
-	static int MockMeasure();
-	static void PublishValue ( int iStack );
+	static StackSizeTuplet_t MockMeasure();
+	static void PublishValue ( StackSizeTuplet_t tStack )
+	{
+		SetMaxExprNodeEvalStackItemSize ( { tStack.m_iCreate, tStack.m_iEval } );
+	}
+
+	static constexpr const char * szReport = "expression stack for deletion";
+	static constexpr const char * szEnv = "NONE";
 };
 
 /////////////////////////////////////////////////////////////////////
@@ -251,7 +406,8 @@ class FilterCreationMeasureStack_c : public StackMeasurer_c
 			CreateFilterContext_t tFCtx;
 			tFCtx.m_pFilters = &tQuery.m_dFilters;
 			tFCtx.m_pFilterTree = &tQuery.m_dFilterTree;
-			tFCtx.m_pSchema = &tParams.m_tSchema;
+			tFCtx.m_pMatchSchema = &tParams.m_tSchema;
+			tFCtx.m_pIndexSchema = &tParams.m_tSchema;
 			tFCtx.m_bScan = true;
 
 			CSphString sWarning;
@@ -268,112 +424,269 @@ protected:
 	StringBuilder_c m_sQuery;
 
 public:
-	static int MockMeasure();
-	static void PublishValue ( int iStack );
+	static StackSizeTuplet_t MockMeasure();
+	static void PublishValue ( StackSizeTuplet_t tStack )
+	{
+		SetFilterStackItemSize ( { tStack.m_iCreate, tStack.m_iEval } );
+	}
+
+	static constexpr const char * szReport = "filter stack delta";
+	static constexpr const char * szEnv = "KNOWN_FILTER_SIZE";
 };
 
-#if defined( __clang__ ) || defined( __GNUC__ )
-#define ATTRIBUTE_NO_SANITIZE_ADDRESS __attribute__ ( ( no_sanitize_address ) )
-#else
-#define ATTRIBUTE_NO_SANITIZE_ADDRESS
-#endif
 
-ATTRIBUTE_NO_SANITIZE_ADDRESS int CreateExprStackSize_c::MockMeasure()
+/////////////////////////////////////////////////////////////////////
+/// calculate stack for FT
+
+#include "searchdaemon.h"
+#include "sphinxsort.h"
+#include "binlog.h"
+
+class FullTextStackSize_c: public StackMeasurer_c
+{
+	void BuildMockExpr ( int iComplexity ) final
+	{
+		m_sExpr.Clear();
+		m_sExpr << "(";
+		for ( int i = 0; i < iComplexity; ++i )
+			m_sExpr << "a ";
+		m_sExpr << "b \"a b\") | ( a -b )";
+	}
+
+
+	void MockParseTest() override
+	{
+		struct
+		{
+			CSphQuery tQuery;
+			CSphQueryResult tQueryResult;
+			CSphMultiQueryArgs tArgs { 1 };
+			SphQueueRes_t tRes;
+			ISphMatchSorter* pSorter;
+		} tParams;
+
+		AggrResult_t tResult;
+		tParams.tQueryResult.m_pMeta = &tResult;
+		tParams.tQuery.m_sQuery = m_sExpr.operator CSphString();
+		auto pParser = sphCreatePlainQueryParser();
+		tParams.tQuery.m_pQueryParser = pParser.get();
+
+		SphQueueSettings_t tQueueSettings ( m_pRtIndex->GetMatchSchema() );
+		tParams.pSorter = sphCreateQueue ( tQueueSettings, tParams.tQuery, tResult.m_sError, tParams.tRes );
+
+		Threads::MockCallCoroutine ( m_dMockStack, [this,&tParams] {
+			m_pRtIndex->MultiQuery ( tParams.tQueryResult, tParams.tQuery, { &tParams.pSorter, 1 }, tParams.tArgs );
+		} );
+
+		SafeDelete ( tParams.pSorter );
+	}
+
+	StringBuilder_c m_sExpr;
+	std::unique_ptr<RtIndex_i> m_pRtIndex;
+
+public:
+	static StackSizeTuplet_t MockMeasure();
+	static void PublishValue ( StackSizeTuplet_t tStack )
+	{
+		SetExtNodeStackSize ( tStack.m_iCreate, tStack.m_iEval );
+	}
+
+	FullTextStackSize_c()
+	{
+		CSphDictSettings tDictSettings;
+
+		auto pTok = Tokenizer::Detail::CreateUTF8Tokenizer();
+		CSphSchema tSrcSchema;
+		tSrcSchema.AddField ( "text" );
+
+		CSphColumnInfo tCol ( sphGetDocidName() );
+		tCol.m_eAttrType = SPH_ATTR_BIGINT;
+		tSrcSchema.AddAttr ( tCol, true );
+
+		CSphString sError;
+		DictRefPtr_c pDict { sphCreateDictionaryCRC ( tDictSettings, nullptr, pTok, "none", false, 32, nullptr, sError ) };
+
+		CSphSchema tSchema;
+		tSchema.AddField ( "text" );
+		tSchema.AddAttr ( tCol, false );
+
+		m_pRtIndex = sphCreateIndexRT ( "testrt", "fake", tSchema, 32 * 1024 * 1024, false );
+
+		m_pRtIndex->SetTokenizer ( pTok->Clone ( SPH_CLONE_INDEX ) );
+		m_pRtIndex->SetDictionary ( pDict->Clone() );
+		m_pRtIndex->ProhibitSave();
+		m_pRtIndex->PostSetup();
+
+		InsertDocData_c tDoc ( m_pRtIndex->GetMatchSchema() );
+		tDoc.SetID ( 1 );
+		tDoc.m_dFields[0] = { "a b", 3 };
+
+		auto& bRTChangesAllowed = RTChangesAllowed();
+		assert ( !bRTChangesAllowed ); // we expect to be run at very beginning, so changes are NOT allowed at that moment.
+		bRTChangesAllowed = true;	   // we don't care about previous value
+
+		RtAccum_t tAcc;
+		CSphString sFilter, sWarning;
+		m_pRtIndex->AddDocument ( tDoc, false, sFilter, sError, sWarning, &tAcc );
+		bool bOldBinlog = Binlog::MockDisabled ( true );
+
+		{ // commit requires coro ctx (hope, 100K frame per level should fit any arch)
+			CSphFixedVector<BYTE> dSafeStack { 100 * 1024 };
+			Threads::MockCallCoroutine ( dSafeStack, [this, &tAcc] { // do in coro as for fat expr it might already require dedicated stack
+				m_pRtIndex->Commit ( nullptr, &tAcc );
+			} );
+		}
+
+		Binlog::MockDisabled ( bOldBinlog );
+		bRTChangesAllowed = false;
+	}
+
+	static constexpr const char * szReport = "fulltext match stack delta";
+	static constexpr const char * szEnv = "KNOWN_MATCH_SIZE";
+};
+
+
+ATTRIBUTE_NO_SANITIZE_ADDRESS StackSizeTuplet_t CreateExprStackSize_c::MockMeasure()
 {
 	CreateExprStackSize_c tCreateMeter;
-	return tCreateMeter.MockMeasureStack ( 5 );
+	return tCreateMeter.MockMeasureStack ();
 }
 
-ATTRIBUTE_NO_SANITIZE_ADDRESS int EvalExprStackSize_c::MockMeasure()
+ATTRIBUTE_NO_SANITIZE_ADDRESS StackSizeTuplet_t EvalExprStackSize_c::MockMeasure()
 {
 	EvalExprStackSize_c tEvalMeter;
-	return tEvalMeter.MockMeasureStack ( 20 );
+	return tEvalMeter.MockMeasureStack ();
 }
 
-ATTRIBUTE_NO_SANITIZE_ADDRESS int FilterCreationMeasureStack_c::MockMeasure()
+
+ATTRIBUTE_NO_SANITIZE_ADDRESS StackSizeTuplet_t DeleteExprStackSize_c::MockMeasure ()
+{
+	DeleteExprStackSize_c tDeleteMeter;
+	return tDeleteMeter.MockMeasureStack ();
+}
+
+ATTRIBUTE_NO_SANITIZE_ADDRESS StackSizeTuplet_t FilterCreationMeasureStack_c::MockMeasure()
 {
 	FilterCreationMeasureStack_c tCreateMeter;
-	return tCreateMeter.MockMeasureStack ( 100 );
+	return tCreateMeter.MockMeasureStack ();
 }
 
-void CreateExprStackSize_c::PublishValue ( int iStack )
+ATTRIBUTE_NO_SANITIZE_ADDRESS StackSizeTuplet_t FullTextStackSize_c::MockMeasure()
 {
-	SetExprNodeStackItemSize ( iStack, 0 );
-}
-
-void EvalExprStackSize_c::PublishValue ( int iStack )
-{
-	SetExprNodeStackItemSize ( 0, iStack );
-}
-
-void FilterCreationMeasureStack_c::PublishValue ( int iStack )
-{
-	SetFilterStackItemSize ( iStack );
+	FullTextStackSize_c tCreateMeter;
+	return tCreateMeter.MockMeasureStack ();
 }
 
 
-template<typename MOCK, int COMPILEDVAL>
-ATTRIBUTE_NO_SANITIZE_ADDRESS void DetermineStackSize ( const char* szReport, const char* szEnv )
+template<typename MOCK, int FRAMEVAL=0, int INITVAL=0>
+ATTRIBUTE_NO_SANITIZE_ADDRESS void DetermineStackSize (StringBuilder_c& sExport)
 {
-	int iSize = COMPILEDVAL;
-	int iNewSize = 0;
+	int iFrameSize = FRAMEVAL;
+	int iInitSize = INITVAL;
+	StackSizeTuplet_t tNewSize {0,0};
+	auto szReport = MOCK::szReport;
+	auto szEnv = MOCK::szEnv;
 	bool bMocked = false;
-	if ( !COMPILEDVAL || Threads::StackMockingAllowed() )
+	if ( !FRAMEVAL || Threads::StackMockingAllowed() )
 	{
 		StringBuilder_c sName;
 		sName << "MANTICORE_" << szEnv;
-		iNewSize = val_from_env ( sName.cstr(), 0 );
+		tNewSize.m_iEval = env_long ( sName.cstr() ).value_or(0);
 
-		if ( !iNewSize )
+		if ( !tNewSize.m_iEval )
 		{
-			iNewSize = MOCK::MockMeasure();
+			tNewSize = MOCK::MockMeasure();
 			bMocked = true;
-
 #ifdef NDEBUG
-			if ( COMPILEDVAL && COMPILEDVAL < iNewSize )
-				sphLogDebug ( "Compiled-in value %s (%d) is less than measured (%d).", szEnv, COMPILEDVAL, iNewSize );
+			if ( FRAMEVAL && FRAMEVAL < tNewSize.m_iEval )
+				sphLogDebug ( "Compiled-in value %s (%d) is less than measured (%d).", szEnv, FRAMEVAL, tNewSize.m_iEval );
 #endif
 		}
-		iSize = iNewSize;
-		if ( bMocked )
-			sphLogDebug ( "%s is %d (mocked, as no env MANTICORE_%s=%d found)", szReport, iSize, szEnv, iNewSize );
+		iFrameSize = tNewSize.m_iEval;
+		if ( bMocked ) {
+			sphLogDebug ( "Frame %s is %d (mocked, as no env MANTICORE_%s=%d found)", szReport, iFrameSize, szEnv, iFrameSize );
+			sExport.Sprint ( "export MANTICORE_", szEnv, "=", iFrameSize, "\n" );
+		}
 		else
-			sphLogDebug ( "%s %d (from env MANTICORE_%s)", szReport, iSize, szEnv );
+			sphLogDebug ( "Frame %s %d (from env MANTICORE_%s)", szReport, iFrameSize, szEnv );
 	} else
 	{
-		sphLogDebug ( "%s is %d (compiled-in)", szReport, iSize );
+		sphLogDebug ( "Frame %s is %d (compiled-in)", szReport, iFrameSize );
 	}
 
-	MOCK::PublishValue ( iSize );
+	if ( !INITVAL || Threads::StackMockingAllowed() )
+	{
+		StringBuilder_c sName;
+		sName << "MANTICORE_START_" << szEnv;
+		tNewSize.m_iCreate = env_long ( sName.cstr() ).value_or ( tNewSize.m_iCreate );
+
+		if ( !bMocked && !tNewSize.m_iCreate )
+		{
+			tNewSize = MOCK::MockMeasure();
+			bMocked = true;
+#ifdef NDEBUG
+			if ( INITVAL && INITVAL < tNewSize.m_iCreate )
+				sphLogDebug ( "Compiled-in value start_%s (%d) is less than measured (%d).", szEnv, INITVAL, tNewSize.m_iCreate );
+#endif
+		}
+		iInitSize = tNewSize.m_iCreate;
+		if ( bMocked ) {
+			sphLogDebug ( "Starting %s is %d (mocked, as no env MANTICORE_START_%s=%d found)", szReport, iInitSize, szEnv, iInitSize );
+			sExport.Sprint ( "export MANTICORE_START_", szEnv, "=", iInitSize, "\n");
+		}
+		else
+			sphLogDebug ( "Starting %s %d (from env MANTICORE_START_%s)", szReport, iInitSize, szEnv );
+	} else
+	{
+		sphLogDebug ( "Starting %s is %d (compiled-in)", szReport, iInitSize );
+	}
+
+	MOCK::PublishValue ( tNewSize );
 }
 
 
-void DetermineNodeItemStackSize()
+void DetermineNodeItemStackSize( StringBuilder_c& sExport )
 {
 	// some values for x86_64: clang 12.0.1 relwithdebinfo = 768, debug = 4208. gcc 9.3 relwithdebinfo = 16, debug = 256
 #ifdef KNOWN_CREATE_SIZE
 	DetermineStackSize<CreateExprStackSize_c, KNOWN_CREATE_SIZE>
 #else
-	DetermineStackSize<CreateExprStackSize_c, 0>
+	DetermineStackSize<CreateExprStackSize_c>
 #endif
-			( "expression stack for creation", "KNOWN_CREATE_SIZE" );
+		(sExport);
 
 	// some values for x86_64: clang 12.0.1 relwithdebinfo = 32, debug = 48. gcc 9.3 relwithdebinfo = 48, debug = 48
 #ifdef KNOWN_EXPR_SIZE
 	DetermineStackSize<EvalExprStackSize_c, KNOWN_EXPR_SIZE>
 #else
-	DetermineStackSize<EvalExprStackSize_c, 0>
+	DetermineStackSize<EvalExprStackSize_c>
 #endif
-			( "expression stack for eval/deletion", "KNOWN_EXPR_SIZE" );
+		(sExport);
+	DetermineStackSize<DeleteExprStackSize_c>(sExport);
 }
 
-void DetermineFilterItemStackSize ()
+void DetermineFilterItemStackSize ( StringBuilder_c& sExport )
 {
 	// some values for x86_64: clang 12.0.1 relwithdebinfo = 208, debug = 400. gcc 9.3 relwithdebinfo = 240, debug = 272
 #ifdef KNOWN_FILTER_SIZE
 	DetermineStackSize<FilterCreationMeasureStack_c, KNOWN_FILTER_SIZE>
 #else
-	DetermineStackSize<FilterCreationMeasureStack_c, 0>
+	DetermineStackSize<FilterCreationMeasureStack_c>
 #endif
-			( "filter stack delta", "KNOWN_FILTER_SIZE" );
+		(sExport);
 }
+
+void DetermineMatchStackSize(StringBuilder_c& sExport)
+{
+#ifdef KNOWN_MATCH_SIZE
+#ifdef START_KNOWN_MATCH_SIZE
+	DetermineStackSize<FullTextStackSize_c, KNOWN_MATCH_SIZE, START_KNOWN_MATCH_SIZE>
+#else
+	DetermineStackSize<FullTextStackSize_c, KNOWN_MATCH_SIZE>
+#endif
+#else
+	DetermineStackSize<FullTextStackSize_c, 0>
+#endif
+		(sExport);
+}
+
